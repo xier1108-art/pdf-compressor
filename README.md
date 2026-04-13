@@ -1,7 +1,7 @@
 # PDF 압축기
 
 인터넷 없이 오프라인에서 사용할 수 있는 가벼운 PDF 압축 도구입니다.  
-[ilovepdf.com](https://www.ilovepdf.com/ko/compress_pdf) 와 동일한 방식으로 PDF 내 이미지를 재압축하여 파일 크기를 줄입니다.
+Ghostscript 엔진을 사용해 이미지 재압축, 폰트 서브셋, 불필요한 데이터 제거로 파일 크기를 줄입니다.
 
 ---
 
