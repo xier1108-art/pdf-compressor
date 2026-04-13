@@ -1,7 +1,6 @@
 # PyInstaller build artifacts
 dist/
 build/
-*.spec
 
 # Python cache
 __pycache__/
