@@ -11,7 +11,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 from core.utils import format_size, get_output_path, ensure_dir
-from core.compressor import compress_pdf
+from core.compressor import compress_pdf, find_ghostscript
 
 # ---------------------------------------------------------------------------
 # Design tokens
@@ -103,9 +103,15 @@ class MainWindow:
         tk.Label(hdr, text="  PDF 압축기",
                  bg=ACCENT, fg="white",
                  font=(FONT, 14, "bold")).pack(side="left", padx=12, pady=12)
-        tk.Label(hdr, text="v1.0  ",
-                 bg=ACCENT, fg="#FFCDD2",
-                 font=(FONT, 8)).pack(side="right", padx=4)
+
+        # Engine badge: Ghostscript or PyMuPDF
+        gs = find_ghostscript()
+        engine_text = "⚡ Ghostscript" if gs else "PyMuPDF (fallback)"
+        engine_bg   = "#C0392B" if gs else "#888888"
+        tk.Label(hdr, text=f" {engine_text} ",
+                 bg=engine_bg, fg="white",
+                 font=(FONT, 8, "bold"),
+                 relief="flat", padx=4).pack(side="right", padx=8, pady=14)
 
     # ------------------------------------------------------------------
     # Drop zone
