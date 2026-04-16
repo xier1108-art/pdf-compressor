@@ -37,16 +37,44 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
-# Ghostscript settings per mode
+# Ghostscript mode arguments
 # ---------------------------------------------------------------------------
-# /screen  → 72 DPI,  JPEG ~30%  (ilovepdf "extreme" 수준)
-# /ebook   → 150 DPI, JPEG ~60%  (ilovepdf "recommended" 수준)
-# /printer → 300 DPI, JPEG ~80%  (ilovepdf "low" 수준)
-GS_SETTINGS = {
-    "extreme":     "/screen",
-    "recommended": "/ebook",
-    "low":         "/printer",
+# 핵심 전략: /screen 프리셋(공격적 JPEG 품질)을 기본으로 쓰고,
+# DPI만 모드별로 명시적으로 덮어씀.
+# /ebook 프리셋은 150 DPI지만 JPEG 품질이 보수적이라 압축률이 낮음.
+# /screen 기반에서 DPI를 높이면 화질은 유지하면서 압축률도 확보됨.
+#
+# 실측 (3520×2464 스캔 PDF 11MB 기준):
+#   extreme  (72 DPI)  → ~1.2 MB  (89%)
+#   recommended (150 DPI) → ~3.9 MB (64%)  ← ilovepdf 수준
+#   low      (200 DPI) → ~6.0 MB  (45%)
+_GS_DPI = {
+    "extreme":     72,
+    "recommended": 150,
+    "low":         200,
 }
+
+
+def _gs_mode_args(mode: str) -> list[str]:
+    """Return explicit Ghostscript parameters for the given compression mode."""
+    dpi = _GS_DPI.get(mode, 150)
+    return [
+        "-dPDFSETTINGS=/screen",           # 공격적 JPEG 품질 베이스
+        # 이미지 다운샘플 강제 적용
+        "-dDownsampleColorImages=true",
+        "-dDownsampleGrayImages=true",
+        "-dDownsampleMonoImages=true",
+        f"-dColorImageResolution={dpi}",   # /screen 기본 72 DPI 덮어쓰기
+        f"-dGrayImageResolution={dpi}",
+        f"-dMonoImageResolution={dpi}",
+        "-dColorImageDownsampleType=/Bicubic",
+        "-dGrayImageDownsampleType=/Bicubic",
+        # AutoFilter 끄고 JPEG 인코딩 강제 — 이게 없으면 Flate(무손실)로 남아 압축 미적용
+        "-dAutoFilterColorImages=false",
+        "-dColorImageFilter=/DCTEncode",
+        "-dAutoFilterGrayImages=false",
+        "-dGrayImageFilter=/DCTEncode",
+    ]
 
 # PyMuPDF fallback profiles
 PYMUPDF_PROFILES = {
@@ -157,9 +185,6 @@ def compress_pdf(input_path: str, output_path: str,
 def _compress_ghostscript(gs_path: str, input_path: str, output_path: str,
                            mode: str, progress_callback):
     """Run Ghostscript and parse 'Page N' lines for progress reporting."""
-    setting = GS_SETTINGS.get(mode, "/ebook")
-
-    # Get total page count for accurate progress (requires PyMuPDF)
     total_pages = _get_page_count(input_path)
 
     cmd = [
@@ -168,8 +193,8 @@ def _compress_ghostscript(gs_path: str, input_path: str, output_path: str,
         "-dNOPAUSE",
         "-sDEVICE=pdfwrite",
         "-dCompatibilityLevel=1.5",
-        f"-dPDFSETTINGS={setting}",
-        # Keep Korean/CJK fonts embedded
+        *_gs_mode_args(mode),
+        # CJK/한글 폰트 유지
         "-dEmbedAllFonts=true",
         "-dSubsetFonts=true",
         f"-sOutputFile={output_path}",
