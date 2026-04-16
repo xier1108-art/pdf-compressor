@@ -201,6 +201,12 @@ def compress_pdf(input_path: str, output_path: str,
         _compress_pymupdf(input_path, output_path, mode, progress_callback)
 
     output_size = os.path.getsize(output_path)
+
+    # 압축 결과가 원본보다 크면 원본을 그대로 복사
+    if output_size > input_size:
+        shutil.copy2(input_path, output_path)
+        output_size = input_size
+
     return input_size, output_size
 
 
