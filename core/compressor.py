@@ -134,16 +134,42 @@ def find_ghostscript() -> str | None:
 
 def _gs_env(gs_path: str) -> dict:
     """
-    Build environment for GS subprocess.
-    When running from a PyInstaller bundle, GS_LIB must point to the
-    bundled lib/ directory so Ghostscript can find its PS library files.
+    Build a minimal, clean environment for the GS subprocess.
+
+    문제: PyInstaller .exe 실행 시 _MEIPASS 폴더(pymupdf·numpy·PIL DLL 수십 개)가
+    PATH에 포함된 채로 gswin64c.exe 서브프로세스가 뜨면, Windows DLL 로더가
+    그 DLL들까지 추가 로드하여 TLS(Thread Local Storage) 슬롯이 고갈됨.
+    → R6016 "not enough space for thread data" 런타임 오류 발생.
+
+    해결: GS 전용 최소 PATH만 사용하고 _MEIPASS 경로를 완전히 차단.
     """
-    env = os.environ.copy()
+    gs_bin = os.path.dirname(os.path.abspath(gs_path))
+
     if hasattr(sys, "_MEIPASS"):
         gs_base = os.path.join(sys._MEIPASS, "gs")
-        env["GS_LIB"] = os.path.join(gs_base, "lib")
-        env["GS_FONTPATH"] = os.path.join(gs_base, "Resource", "Font")
-    return env
+    else:
+        gs_base = os.path.dirname(gs_bin)  # gs10.x.x/ 루트
+
+    sys_root = os.environ.get("SystemRoot", r"C:\Windows")
+    minimal_path = ";".join([
+        gs_bin,
+        os.path.join(sys_root, "System32"),
+        os.path.join(sys_root, "SysWOW64"),
+        sys_root,
+    ])
+
+    return {
+        "PATH":        minimal_path,
+        "GS_LIB":      os.path.join(gs_base, "lib"),
+        "GS_FONTPATH": os.path.join(gs_base, "Resource", "Font"),
+        "SystemRoot":  sys_root,
+        "SystemDrive": os.environ.get("SystemDrive", "C:"),
+        "TEMP":        os.environ.get("TEMP", ""),
+        "TMP":         os.environ.get("TMP", ""),
+        "USERPROFILE": os.environ.get("USERPROFILE", ""),
+        "APPDATA":     os.environ.get("APPDATA", ""),
+        "USERNAME":    os.environ.get("USERNAME", ""),
+    }
 
 
 def get_engine() -> str:
@@ -209,6 +235,7 @@ def _compress_ghostscript(gs_path: str, input_path: str, output_path: str,
         encoding="utf-8",
         errors="replace",
         env=_gs_env(gs_path),
+        cwd=os.path.dirname(os.path.abspath(gs_path)),  # gsdll64.dll 탐색 안정화
     )
 
     current_page = 0
