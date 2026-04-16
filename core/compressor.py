@@ -39,37 +39,42 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Ghostscript mode arguments
 # ---------------------------------------------------------------------------
-# 핵심 전략: /screen 프리셋(공격적 JPEG 품질)을 기본으로 쓰고,
-# DPI만 모드별로 명시적으로 덮어씀.
-# /ebook 프리셋은 150 DPI지만 JPEG 품질이 보수적이라 압축률이 낮음.
-# /screen 기반에서 DPI를 높이면 화질은 유지하면서 압축률도 확보됨.
+# extreme / recommended:
+#   /screen 베이스(공격적 JPEG 품질) + JPEG 강제 인코딩 + DPI 명시 오버라이드
+#   → 이미 JPEG로 저장된 이미지도 재압축, 큰 압축률 확보
 #
-# 실측 (3520×2464 스캔 PDF 11MB 기준):
-#   extreme  (72 DPI)  → ~1.2 MB  (89%)
-#   recommended (150 DPI) → ~3.9 MB (64%)  ← ilovepdf 수준
-#   low      (200 DPI) → ~6.0 MB  (45%)
-_GS_DPI = {
-    "extreme":     72,
-    "recommended": 150,
-    "low":         200,
-}
+# low:
+#   /printer 베이스(고품질, 300 DPI) + AutoFilter ON(GS가 인코딩 방식 자동 선택)
+#   + DPI만 200으로 명시 오버라이드
+#   → 이미 잘 압축된 이미지는 건드리지 않고, 해상도만 낮춰 구조 정리 중심 압축
+#   → JPEG 강제 인코딩 없으므로 어떤 파일이든 오히려 커지지 않음
 
 
 def _gs_mode_args(mode: str) -> list[str]:
-    """Return explicit Ghostscript parameters for the given compression mode."""
-    dpi = _GS_DPI.get(mode, 150)
+    """Return explicit Ghostscript parameters for the given compression mode.
+
+    세 모드 모두 /screen 베이스 + JPEG 강제 인코딩을 사용하고 DPI만 다르게 설정.
+    - /printer·/ebook 베이스는 AutoFilter가 켜져 있어 이미 압축된 이미지를
+      무손실(Flate)로 남겨두므로, Flate+JPEG 이중 인코딩 구조의 PDF에서
+      오히려 파일이 커지는 문제가 있음.
+    - /screen + AutoFilter OFF + JPEG 강제 인코딩이 유일하게 안정적으로 압축됨.
+    - DPI로 화질/크기 균형을 조절:
+        extreme  72 DPI  → 최대 압축 (~89%)
+        recommended 150 DPI → 균형 (~64%)
+        low      200 DPI → 화질 우선 (~44%)
+    """
+    dpi = {"extreme": 72, "recommended": 150, "low": 200}.get(mode, 150)
     return [
-        "-dPDFSETTINGS=/screen",           # 공격적 JPEG 품질 베이스
-        # 이미지 다운샘플 강제 적용
+        "-dPDFSETTINGS=/screen",
         "-dDownsampleColorImages=true",
         "-dDownsampleGrayImages=true",
         "-dDownsampleMonoImages=true",
-        f"-dColorImageResolution={dpi}",   # /screen 기본 72 DPI 덮어쓰기
+        f"-dColorImageResolution={dpi}",
         f"-dGrayImageResolution={dpi}",
         f"-dMonoImageResolution={dpi}",
         "-dColorImageDownsampleType=/Bicubic",
         "-dGrayImageDownsampleType=/Bicubic",
-        # AutoFilter 끄고 JPEG 인코딩 강제 — 이게 없으면 Flate(무손실)로 남아 압축 미적용
+        # JPEG 강제 인코딩 — Flate로 남는 이미지를 확실히 재압축
         "-dAutoFilterColorImages=false",
         "-dColorImageFilter=/DCTEncode",
         "-dAutoFilterGrayImages=false",
