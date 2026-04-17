@@ -21,6 +21,7 @@ if "%GS_DIR%"=="" (
 
 pyinstaller --onefile --windowed ^
     --name "PDF압축기" ^
+    --icon "assets\icon.ico" ^
     --collect-all pymupdf ^
     --collect-all pikepdf ^
     --collect-data tkinterdnd2 ^
