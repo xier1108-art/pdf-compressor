@@ -36,7 +36,7 @@ pip install -r requirements.txt
 | `pymupdf` | PDF 파싱 및 이미지 재압축 (MuPDF 엔진) |
 | `pikepdf` | 구조 정리, 스트림 압축 (QPDF 기반) |
 | `Pillow` | 이미지 리사이즈 및 JPEG 인코딩 |
-| `tkinterdnd2` | 드래그 앤 드롭 지원 |
+| `PyQt6` | 데스크탑 GUI (프레임리스 창, 드래그 앤 드롭, QSS 테마) |
 
 ### 2. 실행
 
@@ -77,7 +77,7 @@ Python이 설치되어 있어야 합니다.
 - **PyMuPDF (fitz)** – PDF 이미지 추출 및 교체
 - **pikepdf** – 구조적 압축 및 메타데이터 정리
 - **Pillow** – 이미지 처리 (리사이즈, JPEG 재인코딩)
-- **tkinter + tkinterdnd2** – 데스크탑 GUI
+- **PyQt6** – 데스크탑 GUI (커스텀 타이틀바, QSS 테마, QThread 백그라운드 압축)
 
 ---
 

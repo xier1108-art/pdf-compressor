@@ -24,9 +24,7 @@ pyinstaller --onefile --windowed ^
     --icon "assets\icon.ico" ^
     --collect-all pymupdf ^
     --collect-all pikepdf ^
-    --collect-data tkinterdnd2 ^
-    --collect-binaries tkinterdnd2 ^
-    --hidden-import PIL._tkinter_finder ^
+    --collect-all PyQt6 ^
     %ADD_GS% ^
     app.py
 

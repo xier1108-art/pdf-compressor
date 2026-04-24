@@ -1,72 +1,494 @@
 """
-Main application window — redesigned.
-Warm beige / terracotta design system (matches the handoff mockup).
+PDF 압축기 — PyQt6 메인 윈도우.
+프레임리스 윈도우 + 커스텀 타이틀바 + mockup 디자인 1:1 구현.
 """
+
+from __future__ import annotations
 
 import os
 import re
 import sys
-import threading
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from dataclasses import dataclass
+from typing import Optional
 
-from core.utils import format_size, get_output_path, ensure_dir
+from PyQt6.QtCore import (
+    QObject, QPoint, QPointF, QPropertyAnimation, QRectF, QSize, Qt, QThread,
+    QTimer, pyqtProperty, pyqtSignal, pyqtSlot,
+)
+from PyQt6.QtGui import (
+    QBrush, QColor, QDragEnterEvent, QDropEvent, QFont, QIcon, QMouseEvent,
+    QPainter, QPainterPath, QPen, QPixmap,
+)
+from PyQt6.QtWidgets import (
+    QAbstractItemView, QApplication, QFileDialog, QFrame,
+    QHBoxLayout, QHeaderView, QLabel, QMainWindow, QMessageBox, QProgressBar,
+    QPushButton, QSizePolicy, QStackedLayout, QStackedWidget, QTableWidget, QTableWidgetItem,
+    QVBoxLayout, QWidget,
+)
+
 from core.compressor import compress_pdf, find_ghostscript
+from core.utils import ensure_dir, format_size, get_output_path
 
-# ─── Design tokens (mirrors app.css) ────────────────────────────────────────
-BG_WINDOW   = "#ffffff"
-BG_TITLEBAR = "#f8f8f8"
-BG_HEADER   = "#fff6f3"
-BG_LIST_HDR = "#fbf9f6"
-BG_ACTION   = "#f7f4ef"
-BG_SUBTLE   = "#faf8f5"
-BG_PANEL    = "#ffffff"
-
-INK_900 = "#1a1814"
-INK_700 = "#3a342c"
-INK_500 = "#7a7367"
-INK_400 = "#9b9388"
-INK_300 = "#c7bfb2"
-INK_200 = "#e5ded0"
-INK_100 = "#eeeae2"
-INK_50  = "#f6f3ed"
-
-ACCENT      = "#e05543"
-ACCENT_DK   = "#c73a28"
-ACCENT_TINT = "#fef4f1"
-ACCENT_SOFT = "#fdece8"
-
-SUCCESS     = "#3f8f5e"
-SUCCESS_BG  = "#f0faf3"
-SUCCESS_DK  = "#1f5237"
-SUCCESS_MID = "#3d6b51"
-SUCCESS_BRD = "#d5ead9"
-
-APP_VERSION = "v1.5.0"
-FONT = "Malgun Gothic"
-MONO = "Consolas"
-
-WIN_W = 760
-WIN_H = 640
+from ui import styles as S
 
 
-class MainWindow:
-    def __init__(self, root: tk.Tk, has_dnd: bool = False):
-        self.root     = root
-        self.has_dnd  = has_dnd
-        self.files: dict = {}          # path → {original_size, compressed_size, tree_id}
-        self.output_dir = os.path.join(os.path.expanduser("~"), "Desktop", "PDF압축결과")
-        self.mode    = tk.StringVar(value="recommended")
+# ─── Custom painted widgets ───────────────────────────────────────────────────
+
+class BrandMark(QLabel):
+    """36×36 rounded accent square with mini PDF icon."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(36, 36)
+
+    def paintEvent(self, _ev):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = QRectF(0, 0, 36, 36)
+
+        # Gradient accent square
+        path = QPainterPath()
+        path.addRoundedRect(rect, 9, 9)
+        grad = QColor(S.ACCENT)
+        p.fillPath(path, QBrush(grad))
+
+        # Mini PDF doc (white rounded rect with folded corner)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor("white"))
+        p.drawRoundedRect(QRectF(9, 6, 14, 24), 2, 2)
+        p.setBrush(QColor("#fde0db"))
+        pts = QPainterPath()
+        pts.moveTo(19, 6); pts.lineTo(23, 10); pts.lineTo(23, 12); pts.lineTo(19, 12)
+        pts.closeSubpath()
+        p.fillPath(pts, QBrush(QColor("#fde0db")))
+
+        # PDF badge
+        p.setBrush(QColor(S.ACCENT))
+        p.drawRoundedRect(QRectF(8, 19, 20, 8), 1.5, 1.5)
+
+        p.setPen(QColor("white"))
+        f = QFont("Segoe UI", 6)
+        f.setBold(True)
+        p.setFont(f)
+        p.drawText(QRectF(8, 19, 20, 8), Qt.AlignmentFlag.AlignCenter, "PDF")
+        p.end()
+
+
+class PdfIcon(QLabel):
+    """Small PDF file icon for list rows."""
+    def __init__(self, size=18, parent=None):
+        super().__init__(parent)
+        self._size = size
+        self.setFixedSize(size, int(size * 48 / 40))
+
+    def paintEvent(self, _ev):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        # Scale 40×48 → w×h
+        sx, sy = w / 40, h / 48
+
+        p.setPen(QPen(QColor(S.ACCENT), 1.5))
+        p.setBrush(QColor("white"))
+        path = QPainterPath()
+        path.moveTo(4 * sx, 2 * sy)
+        path.lineTo(26 * sx, 2 * sy)
+        path.lineTo(36 * sx, 12 * sy)
+        path.lineTo(36 * sx, 44 * sy)
+        path.quadTo(36 * sx, 46 * sy, 34 * sx, 46 * sy)
+        path.lineTo(4 * sx, 46 * sy)
+        path.quadTo(2 * sx, 46 * sy, 2 * sx, 44 * sy)
+        path.lineTo(2 * sx, 4 * sy)
+        path.quadTo(2 * sx, 2 * sy, 4 * sx, 2 * sy)
+        p.drawPath(path)
+
+        # Folded corner
+        p.setBrush(QColor("#fef4f1"))
+        cp = QPainterPath()
+        cp.moveTo(26 * sx, 2 * sy)
+        cp.lineTo(26 * sx, 12 * sy)
+        cp.lineTo(36 * sx, 12 * sy)
+        p.drawPath(cp)
+
+        # PDF badge
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(S.ACCENT))
+        p.drawRoundedRect(QRectF(7 * sx, 26 * sy, 26 * sx, 13 * sy), 2, 2)
+
+        p.setPen(QColor("white"))
+        f = QFont("Segoe UI", max(5, int(self._size * 0.35)))
+        f.setBold(True)
+        p.setFont(f)
+        p.drawText(QRectF(7 * sx, 26 * sy, 26 * sx, 13 * sy),
+                   Qt.AlignmentFlag.AlignCenter, "PDF")
+        p.end()
+
+
+class PlusCircle(QLabel):
+    """44×44 white circle with + sign (drop zone icon)."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(44, 44)
+
+    def paintEvent(self, _ev):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        # Circle
+        p.setPen(QPen(QColor(224, 85, 67, 40), 1))
+        p.setBrush(QColor("white"))
+        p.drawEllipse(QRectF(1, 1, 42, 42))
+        # + sign
+        p.setPen(QPen(QColor(S.ACCENT), 2.3, cap=Qt.PenCapStyle.RoundCap))
+        p.drawLine(22, 14, 22, 30)
+        p.drawLine(14, 22, 30, 22)
+        p.end()
+
+
+class PulsingDot(QLabel):
+    """6×6 dot that pulses the accent color."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(6, 6)
+        self._alpha = 1.0
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+        self._phase = 0
+
+    def start(self):
+        self._phase = 0
+        self._timer.start(60)
+
+    def stop(self):
+        self._timer.stop()
+        self.update()
+
+    def _tick(self):
+        self._phase = (self._phase + 1) % 20
+        self.update()
+
+    def paintEvent(self, _ev):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        if self._timer.isActive():
+            t = self._phase / 10.0 if self._phase < 10 else (20 - self._phase) / 10.0
+        else:
+            t = 1.0
+        r = int(0xf0 + (0xe0 - 0xf0) * t)
+        g = int(0xa9 + (0x55 - 0xa9) * t)
+        b = int(0x9f + (0x43 - 0x9f) * t)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(r, g, b))
+        p.drawEllipse(QRectF(0, 0, 6, 6))
+        p.end()
+
+
+class CheckIcon(QLabel):
+    """36×36 green filled circle with white check."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(36, 36)
+
+    def paintEvent(self, _ev):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(S.SUCCESS))
+        p.drawEllipse(QRectF(0, 0, 36, 36))
+
+        pen = QPen(QColor("white"), 3)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        p.setPen(pen)
+        path = QPainterPath()
+        path.moveTo(10, 18)
+        path.lineTo(16, 24)
+        path.lineTo(27, 12)
+        p.drawPath(path)
+        p.end()
+
+
+class RatioBar(QWidget):
+    """Ratio bar + text (for file list cells)."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(24)
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(8, 0, 8, 0)
+        lay.setSpacing(8)
+        lay.addStretch(1)
+
+        self.bar_bg = QFrame()
+        self.bar_bg.setObjectName("ratioBarBg")
+        self.bar_bg.setFixedSize(42, 5)
+        bar_lay = QHBoxLayout(self.bar_bg)
+        bar_lay.setContentsMargins(0, 0, 0, 0)
+        bar_lay.setSpacing(0)
+        self.bar_fill = QFrame()
+        self.bar_fill.setObjectName("ratioBarFill")
+        bar_lay.addWidget(self.bar_fill)
+        bar_lay.addStretch(1)
+
+        self.text = QLabel("—")
+        self.text.setObjectName("ratioText")
+        self.text.setMinimumWidth(52)
+        self.text.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        lay.addWidget(self.bar_bg)
+        lay.addWidget(self.text)
+
+        self.set_pending()
+
+    def set_pending(self):
+        self.bar_bg.hide()
+        self.text.setText("—")
+        self.text.setProperty("pending", "true")
+        self.text.setProperty("working", "false")
+        self._refresh_style()
+
+    def set_working(self):
+        self.bar_bg.hide()
+        self.text.setText("처리 중")
+        self.text.setProperty("pending", "false")
+        self.text.setProperty("working", "true")
+        self._refresh_style()
+
+    def set_done(self, ratio: float):
+        self.bar_bg.show()
+        w_total = 42
+        fill_w = max(1, int(min(100, max(0, ratio)) / 100 * w_total))
+        self.bar_fill.setFixedWidth(fill_w)
+        self.text.setText(f"−{ratio:.1f}%")
+        self.text.setProperty("pending", "false")
+        self.text.setProperty("working", "false")
+        self._refresh_style()
+
+    def set_error(self):
+        self.bar_bg.hide()
+        self.text.setText("오류")
+        self.text.setProperty("pending", "true")
+        self.text.setProperty("working", "false")
+        self._refresh_style()
+
+    def _refresh_style(self):
+        self.text.style().unpolish(self.text)
+        self.text.style().polish(self.text)
+
+
+class FileNameCell(QWidget):
+    """PDF icon + file name label for the file column."""
+    def __init__(self, name: str, parent=None):
+        super().__init__(parent)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(10, 0, 10, 0)
+        lay.setSpacing(10)
+        self.icon = PdfIcon(size=18)
+        self.label = QLabel(name)
+        self.label.setStyleSheet(f"color: {S.INK_900}; font-size: 12px; font-weight: 500;")
+        self.label.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
+        lay.addWidget(self.icon)
+        lay.addWidget(self.label, 1)
+
+
+class DropZone(QFrame):
+    """Drag-drop area with dashed border."""
+    filesDropped = pyqtSignal(list)
+    clicked = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("dropZone")
+        self.setAcceptDrops(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFixedHeight(108)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(20, 14, 20, 14)
+        lay.setSpacing(4)
+        lay.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self.icon = PlusCircle()
+        self.icon.setObjectName("dzIcon")
+        lay.addWidget(self.icon, 0, Qt.AlignmentFlag.AlignHCenter)
+
+        title = QLabel(
+            "PDF 파일을 드래그하거나 "
+            "<span style='background:white; border:1px solid #e5ded0; "
+            "border-radius:4px; padding:1px 6px; color:#3a342c; "
+            "font-family:Consolas, monospace; font-size:10px;'>클릭</span>"
+            " 하여 선택"
+        )
+        title.setObjectName("dzTitle")
+        title.setTextFormat(Qt.TextFormat.RichText)
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lay.addWidget(title, 0, Qt.AlignmentFlag.AlignHCenter)
+
+        self.sub = QLabel("🔒 원본 파일은 변경되지 않습니다 · 여러 파일 선택 가능")
+        self.sub.setObjectName("dzSub")
+        lay.addWidget(self.sub, 0, Qt.AlignmentFlag.AlignHCenter)
+
+    def enterEvent(self, _ev):
+        self.setProperty("hover", "true")
+        self._refresh()
+
+    def leaveEvent(self, _ev):
+        self.setProperty("hover", "false")
+        self._refresh()
+
+    def mousePressEvent(self, ev: QMouseEvent):
+        if ev.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+
+    def dragEnterEvent(self, ev: QDragEnterEvent):
+        if ev.mimeData().hasUrls():
+            ev.acceptProposedAction()
+            self.setProperty("dragActive", "true")
+            self._refresh()
+
+    def dragLeaveEvent(self, _ev):
+        self.setProperty("dragActive", "false")
+        self._refresh()
+
+    def dropEvent(self, ev: QDropEvent):
+        self.setProperty("dragActive", "false")
+        self._refresh()
+        paths = []
+        for url in ev.mimeData().urls():
+            p = url.toLocalFile()
+            if p.lower().endswith(".pdf") and os.path.isfile(p):
+                paths.append(p)
+        if paths:
+            self.filesDropped.emit(paths)
+
+    def _refresh(self):
+        self.style().unpolish(self)
+        self.style().polish(self)
+
+
+# ─── Quality card (segmented button) ─────────────────────────────────────────
+
+class QualityCard(QFrame):
+    clicked = pyqtSignal()
+
+    @dataclass
+    class Spec:
+        qid: str
+        name: str
+        spec: str
+        est: str
+
+    def __init__(self, spec: Spec, parent=None):
+        super().__init__(parent)
+        self.spec = spec
+        self.setObjectName("qCard")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(10, 8, 10, 9)
+        lay.setSpacing(3)
+
+        top = QHBoxLayout(); top.setSpacing(6); top.setContentsMargins(0, 0, 0, 0)
+        self.dot = QFrame(); self.dot.setObjectName("qCardDot")
+        self.dot.setFixedSize(8, 8)
+        self.name_lbl = QLabel(spec.name); self.name_lbl.setObjectName("qCardName")
+        top.addWidget(self.dot); top.addWidget(self.name_lbl); top.addStretch(1)
+
+        wrap_top = QWidget(); wrap_top.setLayout(top)
+        lay.addWidget(wrap_top)
+
+        self.spec_lbl = QLabel(spec.spec); self.spec_lbl.setObjectName("qCardSpec")
+        lay.addWidget(self.spec_lbl)
+
+        est_row = QHBoxLayout(); est_row.setSpacing(4); est_row.setContentsMargins(0, 2, 0, 0)
+        est_prefix = QLabel("예상 감소"); est_prefix.setObjectName("qCardEst")
+        est_value  = QLabel(spec.est);   est_value.setObjectName("qCardEstStrong")
+        est_row.addWidget(est_prefix); est_row.addWidget(est_value); est_row.addStretch(1)
+        wrap_est = QWidget(); wrap_est.setLayout(est_row)
+        lay.addWidget(wrap_est)
+
+        self.est_prefix = est_prefix
+
+    def mousePressEvent(self, ev: QMouseEvent):
+        if ev.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+
+    def setActive(self, active: bool):
+        self.setProperty("active", "true" if active else "false")
+        self.dot.setProperty("active", "true" if active else "false")
+        self.est_prefix.setProperty("active", "true" if active else "false")
+        for w in (self, self.dot, self.est_prefix):
+            w.style().unpolish(w); w.style().polish(w)
+
+
+# ─── Compression worker (QThread) ────────────────────────────────────────────
+
+class CompressionWorker(QThread):
+    fileStarted  = pyqtSignal(int, str)            # idx, filename
+    fileProgress = pyqtSignal(int, float)          # idx, overall_pct
+    fileDone     = pyqtSignal(int, int, int, float) # idx, in_sz, out_sz, ratio
+    fileError    = pyqtSignal(int, str)            # idx, msg
+    allDone      = pyqtSignal(int, int, int)       # n_files, tot_orig, tot_comp
+
+    def __init__(self, entries, mode: str, output_dir: str):
+        super().__init__()
+        self.entries = entries              # list of (idx, path)
+        self.mode = mode
+        self.output_dir = output_dir
+
+    def run(self):
+        total = len(self.entries)
+        tot_orig = 0
+        tot_comp = 0
+
+        for fi, (idx, path) in enumerate(self.entries):
+            fname = os.path.basename(path)
+            self.fileStarted.emit(idx, fname)
+
+            out_path = get_output_path(path, self.output_dir)
+
+            def _cb(cur, tot, fi=fi):
+                pct = (fi + cur / max(tot, 1)) / total * 100
+                self.fileProgress.emit(idx, pct)
+
+            try:
+                in_sz, out_sz = compress_pdf(path, out_path, self.mode, _cb)
+                tot_orig += in_sz
+                tot_comp += out_sz
+                ratio = (1 - out_sz / in_sz) * 100 if in_sz else 0
+                self.fileDone.emit(idx, in_sz, out_sz, ratio)
+            except Exception as exc:
+                self.fileError.emit(idx, str(exc))
+
+            self.fileProgress.emit(idx, (fi + 1) / total * 100)
+
+        self.allDone.emit(total, tot_orig, tot_comp)
+
+
+# ─── Main window ─────────────────────────────────────────────────────────────
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setObjectName("rootWindow")
+        self.setWindowTitle("PDF 압축기")
+        self.resize(820, 720)
+
+        # Frameless (no translucent background — solid edges)
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
+
+        self.files: list[dict] = []                 # [{path, size, comp_size, widgets}, ...]
+        self.output_dir = os.path.join(
+            os.path.expanduser("~"), "Desktop", "PDF압축결과")
+        self.current_mode = "recommended"
         self.is_compressing = False
-        self._dot_anim_id   = None
+        self._worker: Optional[CompressionWorker] = None
+        self._drag_pos: Optional[QPoint] = None
 
         gs = find_ghostscript()
         self._has_gs = bool(gs)
         self._gs_ver = self._detect_gs_ver(gs) if gs else None
 
-        self._setup_window()
-        self._setup_style()
-        self._build_layout()
+        self._build_ui()
+        self.setStyleSheet(S.QSS)
 
     # ── Utilities ────────────────────────────────────────────────────────────
 
@@ -82,742 +504,574 @@ class MainWindow:
             return "v10"
 
     @staticmethod
-    def _shorten_path(path: str, max_len: int = 46) -> str:
-        return path if len(path) <= max_len else "…" + path[-(max_len - 1):]
+    def _shorten_path(p: str, max_len: int = 50) -> str:
+        return p if len(p) <= max_len else "…" + p[-(max_len - 1):]
 
-    # ── Window / style ───────────────────────────────────────────────────────
+    # ── UI build ─────────────────────────────────────────────────────────────
 
-    def _setup_window(self):
-        self.root.title("PDF 압축기")
-        self.root.geometry(f"{WIN_W}x{WIN_H}")
-        self.root.resizable(False, False)
-        self.root.configure(bg=BG_WINDOW)
-        self.root.update_idletasks()
-        sw = self.root.winfo_screenwidth()
-        sh = self.root.winfo_screenheight()
-        self.root.geometry(f"{WIN_W}x{WIN_H}+{(sw - WIN_W) // 2}+{(sh - WIN_H) // 2}")
+    def _build_ui(self):
+        self.frame = QFrame()
+        self.frame.setObjectName("winFrame")
+        self.setCentralWidget(self.frame)
 
-    def _setup_style(self):
-        s = ttk.Style(self.root)
-        s.theme_use("clam")
+        lay = QVBoxLayout(self.frame)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
 
-        s.configure("Files.Treeview",
-                    background=BG_PANEL, foreground=INK_700,
-                    fieldbackground=BG_PANEL,
-                    font=(FONT, 9), rowheight=26,
-                    borderwidth=0, relief="flat")
-        s.configure("Files.Treeview.Heading",
-                    background=BG_LIST_HDR, foreground=INK_500,
-                    font=(FONT, 8, "bold"),
-                    relief="flat", borderwidth=0)
-        s.map("Files.Treeview",
-              background=[("selected", ACCENT_TINT)],
-              foreground=[("selected", INK_900)])
-        s.map("Files.Treeview.Heading",
-              background=[("active", BG_LIST_HDR)],
-              relief=[("active", "flat")])
-        s.layout("Files.Treeview",
-                 [("Treeview.treearea", {"sticky": "nswe"})])
+        lay.addWidget(self._build_titlebar())
+        lay.addWidget(self._build_app_header())
+        lay.addWidget(self._build_main(), 1)
+        lay.addWidget(self._build_bottom_stack())
+        lay.addWidget(self._build_status_rail())
 
-        s.configure("Accent.Horizontal.TProgressbar",
-                    background=ACCENT, troughcolor=INK_100,
-                    borderwidth=0, thickness=6)
+        self._update_count()   # set initial empty-state + disable compress btn
 
-    # ── Master layout ────────────────────────────────────────────────────────
+    # Titlebar
+    def _build_titlebar(self) -> QWidget:
+        bar = QFrame()
+        bar.setObjectName("titleBar")
+        bar.setFixedHeight(34)
+        self._titlebar = bar
 
-    def _build_layout(self):
-        # Pack bottom-anchored elements FIRST so they reserve space correctly.
-        self._build_status_rail()         # very bottom
-        self._build_bottom_container()    # above status rail (holds swapping panels)
+        lay = QHBoxLayout(bar)
+        lay.setContentsMargins(12, 0, 0, 0)
+        lay.setSpacing(8)
 
-        # Then top-anchored elements
-        self._build_titlebar()            # thin strip at top
-        self._build_app_header()          # brand + engine badge
+        # Mini PDF icon
+        ic = QLabel()
+        ic.setFixedSize(14, 14)
+        pix = QPixmap(14, 14); pix.fill(Qt.GlobalColor.transparent)
+        pn = QPainter(pix); pn.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pn.setPen(Qt.PenStyle.NoPen); pn.setBrush(QColor(S.ACCENT))
+        pn.drawRoundedRect(QRectF(0, 0, 10, 14), 1, 1)
+        pn.setPen(QColor("white")); pn.setFont(QFont("Segoe UI", 4, QFont.Weight.Bold))
+        pn.drawText(QRectF(0, 4, 10, 8), Qt.AlignmentFlag.AlignCenter, "PDF")
+        pn.end()
+        ic.setPixmap(pix)
+        lay.addWidget(ic)
 
-        # Main scrollable-ish area (fills remaining space)
-        wrap = tk.Frame(self.root, bg=BG_WINDOW)
-        wrap.pack(fill="both", expand=True)
-        self.content = tk.Frame(wrap, bg=BG_WINDOW, padx=24)
-        self.content.pack(fill="both", expand=True, pady=(16, 12))
+        title = QLabel("PDF 압축기"); title.setObjectName("titleText")
+        lay.addWidget(title)
+        lay.addStretch(1)
 
-        self._build_drop_zone()
-        self._build_file_list()
-        self._build_quality_panel()
+        for sym, is_close, cmd in [("─", False, self.showMinimized),
+                                      ("□", False, self._toggle_max),
+                                      ("✕", True,  self.close)]:
+            b = QPushButton(sym)
+            b.setObjectName("tbClose" if is_close else "tbBtn")
+            b.setFlat(True)
+            b.clicked.connect(cmd)
+            lay.addWidget(b)
 
-    # ── Titlebar ─────────────────────────────────────────────────────────────
+        # tbClose falls back to tbBtn styling; add specific close styling via stylesheet
+        bar.mouseDoubleClickEvent = lambda e: self._toggle_max()
+        return bar
 
-    def _build_titlebar(self):
-        bar = tk.Frame(self.root, bg=BG_TITLEBAR, height=32)
-        bar.pack(fill="x")
-        bar.pack_propagate(False)
-
-        # PDF icon (canvas)
-        ic = tk.Canvas(bar, width=14, height=14,
-                       bg=BG_TITLEBAR, highlightthickness=0)
-        ic.pack(side="left", padx=(10, 0), pady=9)
-        ic.create_rectangle(0, 0, 10, 13, fill=ACCENT, outline="")
-        ic.create_polygon(7, 0, 10, 0, 10, 4, 7, 4, fill=BG_TITLEBAR, outline="")
-        ic.create_polygon(7, 0, 10, 4, 7, 4, fill=INK_300, outline="")
-
-        tk.Label(bar, text="PDF 압축기",
-                 bg=BG_TITLEBAR, fg=INK_700,
-                 font=(FONT, 9)).pack(side="left", padx=7)
-
-        # Window control buttons (decorative — X is wired to destroy)
-        specs = [("─", BG_TITLEBAR, INK_900, None),
-                 ("□", BG_TITLEBAR, INK_900, None),
-                 ("✕", "#e81123",   "white", self.root.destroy)]
-        for sym, h_bg, h_fg, cmd in specs:
-            b = tk.Label(bar, text=sym, bg=BG_TITLEBAR, fg=INK_500,
-                         font=(FONT, 9), width=4, cursor="hand2")
-            b.pack(side="right", ipady=5)
-            b.bind("<Enter>",    lambda e, w=b, hb=h_bg, hf=h_fg: w.configure(bg=hb, fg=hf))
-            b.bind("<Leave>",    lambda e, w=b: w.configure(bg=BG_TITLEBAR, fg=INK_500))
-            if cmd:
-                b.bind("<Button-1>", lambda e, fn=cmd: fn())
-
-        tk.Frame(self.root, bg=INK_100, height=1).pack(fill="x")
-
-    # ── App header band ──────────────────────────────────────────────────────
-
-    def _build_app_header(self):
-        hdr = tk.Frame(self.root, bg=BG_HEADER)
-        hdr.pack(fill="x")
-
-        inner = tk.Frame(hdr, bg=BG_HEADER)
-        inner.pack(fill="x", padx=24, pady=(14, 12))
-
-        # Brand (left)
-        brand = tk.Frame(inner, bg=BG_HEADER)
-        brand.pack(side="left")
-
-        mark = tk.Canvas(brand, width=36, height=36,
-                         bg=BG_HEADER, highlightthickness=0)
-        mark.pack(side="left", padx=(0, 10))
-        mark.create_rectangle(0, 0, 36, 36, fill=ACCENT, outline="")
-        # White doc shape
-        mark.create_rectangle(8,  5, 22, 30, fill="white", outline="")
-        mark.create_polygon(19, 5, 27, 13, 22, 30,  8, 30,  8,  5,
-                            fill="#fde0db", outline="")
-        mark.create_rectangle(8, 18, 28, 27, fill=ACCENT, outline="")
-        mark.create_text(18, 23, text="PDF", fill="white",
-                         font=(FONT, 5, "bold"))
-
-        tf = tk.Frame(brand, bg=BG_HEADER)
-        tf.pack(side="left")
-        tk.Label(tf, text="PDF 압축기",
-                 bg=BG_HEADER, fg=INK_900,
-                 font=(FONT, 13, "bold")).pack(anchor="w")
-        tk.Label(tf, text="오프라인 · 원본 보존 · 배치 처리",
-                 bg=BG_HEADER, fg=INK_500,
-                 font=(FONT, 8)).pack(anchor="w", pady=(2, 0))
-
-        # Engine badge (right)
-        if self._has_gs:
-            badge_bg = INK_900
-            badge_txt = f"⚡ Ghostscript  {self._gs_ver}" if self._gs_ver else "⚡ Ghostscript"
-            badge_fg = "#f8f4ed"
+    def _toggle_max(self):
+        if self.isMaximized():
+            self.showNormal()
         else:
-            badge_bg = "#555555"
-            badge_txt = "PyMuPDF fallback"
-            badge_fg = "white"
-
-        badge = tk.Frame(inner, bg=badge_bg)
-        badge.pack(side="right")
-        tk.Label(badge, text=badge_txt,
-                 bg=badge_bg, fg=badge_fg,
-                 font=(FONT, 8, "bold"),
-                 padx=10, pady=5).pack()
-
-        tk.Frame(self.root, bg=INK_100, height=1).pack(fill="x")
-
-    # ── Drop zone ────────────────────────────────────────────────────────────
-
-    def _build_drop_zone(self):
-        self.drop_canvas = tk.Canvas(self.content, height=84,
-                                     bg=ACCENT_TINT, highlightthickness=0,
-                                     cursor="hand2")
-        self.drop_canvas.pack(fill="x", pady=(0, 14))
-        self._draw_drop_zone(active=False)
-
-        self.drop_canvas.bind("<Button-1>",  lambda _e: self._browse_files())
-        self.drop_canvas.bind("<Enter>",     lambda _e: self._draw_drop_zone(active=True))
-        self.drop_canvas.bind("<Leave>",     lambda _e: self._draw_drop_zone(active=False))
-        self.drop_canvas.bind("<Configure>", lambda _e: self._draw_drop_zone(
-            active=False))
-
-        if self.has_dnd:
-            try:
-                from tkinterdnd2 import DND_FILES
-                self.drop_canvas.drop_target_register(DND_FILES)
-                self.drop_canvas.dnd_bind("<<Drop>>", self._on_dnd_drop)
-                self.drop_canvas.dnd_bind("<<DragEnter>>",
-                                          lambda _e: self._draw_drop_zone(active=True))
-                self.drop_canvas.dnd_bind("<<DragLeave>>",
-                                          lambda _e: self._draw_drop_zone(active=False))
-            except Exception:
-                pass
-
-    def _draw_drop_zone(self, *, active: bool):
-        c = self.drop_canvas
-        c.update_idletasks()
-        w = c.winfo_width() or (WIN_W - 48)
-        h = 84
-        c.delete("all")
-
-        bg     = "#fdece7" if active else ACCENT_TINT
-        border = ACCENT   if active else "#f0a99f"
-        c.configure(bg=bg)
-        c.create_rectangle(2, 2, w - 2, h - 2,
-                           outline=border, width=2, dash=(8, 4), fill=bg)
-
-        cx = w // 2
-        # Plus circle
-        c.create_oval(cx - 18, 10, cx + 18, 46,
-                      fill="white", outline=border, width=1)
-        c.create_line(cx, 22, cx, 34, fill=ACCENT, width=2, capstyle="round")
-        c.create_line(cx - 6, 28, cx + 6, 28, fill=ACCENT, width=2, capstyle="round")
-
-        c.create_text(cx, 57,
-                      text="PDF 파일을 드래그하거나  클릭  하여 선택",
-                      font=(FONT, 9, "bold"), fill=INK_900)
-        c.create_text(cx, 72,
-                      text="🔒 원본 파일은 변경되지 않습니다  ·  여러 파일 선택 가능",
-                      font=(FONT, 8), fill=INK_500)
-
-    # ── File list ────────────────────────────────────────────────────────────
-
-    def _build_file_list(self):
-        # Section header
-        sh = tk.Frame(self.content, bg=BG_WINDOW)
-        sh.pack(fill="x", pady=(0, 6))
-        tk.Label(sh, text="파일 목록",
-                 bg=BG_WINDOW, fg=INK_700,
-                 font=(FONT, 8, "bold")).pack(side="left")
-        self.count_lbl = tk.Label(sh, text="0개 파일",
-                                   bg=BG_WINDOW, fg=INK_500,
-                                   font=(FONT, 8))
-        self.count_lbl.pack(side="right")
-
-        # Border wrapper (1 px INK_100)
-        wrap = tk.Frame(self.content, bg=INK_100)
-        wrap.pack(fill="x")
-        inner = tk.Frame(wrap, bg=BG_PANEL)
-        inner.pack(fill="both", padx=1, pady=1)
-
-        cols = ("filename", "original", "compressed", "ratio")
-        self.tree = ttk.Treeview(inner, columns=cols,
-                                  show="headings",
-                                  style="Files.Treeview",
-                                  height=6)
-        self.tree.heading("filename",   text="파일명",   anchor="w")
-        self.tree.heading("original",   text="원본 크기", anchor="e")
-        self.tree.heading("compressed", text="압축 크기", anchor="e")
-        self.tree.heading("ratio",      text="압축률",   anchor="e")
-
-        self.tree.column("filename",   width=370, anchor="w",  stretch=True)
-        self.tree.column("original",   width=88,  anchor="e",  stretch=False)
-        self.tree.column("compressed", width=88,  anchor="e",  stretch=False)
-        self.tree.column("ratio",      width=88,  anchor="e",  stretch=False)
-
-        # Color tags
-        self.tree.tag_configure("pending", foreground=INK_300)
-        self.tree.tag_configure("done",    foreground=INK_700)
-        self.tree.tag_configure("ratio_ok", foreground=SUCCESS)
-        self.tree.tag_configure("error",   foreground=ACCENT)
-
-        sb = ttk.Scrollbar(inner, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=sb.set)
-        self.tree.pack(side="left", fill="both", expand=True)
-        sb.pack(side="right", fill="y")
-
-        self.tree.bind("<Delete>", self._remove_selected)
-
-        # Hint
-        hint = tk.Frame(self.content, bg=BG_WINDOW)
-        hint.pack(fill="x", pady=(3, 0))
-        tk.Label(hint, text="Del 키로 목록에서 제거",
-                 bg=BG_WINDOW, fg=INK_400,
-                 font=(FONT, 8)).pack(anchor="e")
-
-    # ── Quality panel ────────────────────────────────────────────────────────
-
-    QUALITY_OPTIONS = [
-        ("extreme",     "최대 압축", "900px · Q35",  "70–90%"),
-        ("recommended", "권장",      "1600px · Q65", "40–70%"),
-        ("low",         "저압축",    "2400px · Q85", "20–40%"),
-    ]
-
-    def _build_quality_panel(self):
-        outer = tk.Frame(self.content, bg=BG_WINDOW)
-        outer.pack(fill="x", pady=(10, 0))
-
-        tk.Label(outer, text="압축 수준",
-                 bg=BG_WINDOW, fg=INK_700,
-                 font=(FONT, 8, "bold")).pack(side="left", padx=(0, 14))
-
-        seg = tk.Frame(outer, bg=INK_50, padx=4, pady=4)
-        seg.pack(side="left", fill="x", expand=True)
-
-        self._q_cards: dict = {}
-        for i, (qid, name, spec, est) in enumerate(self.QUALITY_OPTIONS):
-            pad_r = 5 if i < 2 else 0
-
-            # Outer card frame — its bg acts as the border color when active
-            oc = tk.Frame(seg, bg=INK_50)
-            oc.pack(side="left", fill="both", expand=True, padx=(0, pad_r))
-
-            # Inner card frame — 1 px inset from oc
-            ic = tk.Frame(oc, bg=INK_50, padx=8, pady=8, cursor="hand2")
-            ic.pack(fill="both", expand=True, padx=1, pady=1)
-
-            top = tk.Frame(ic, bg=INK_50)
-            top.pack(fill="x")
-
-            dot = tk.Canvas(top, width=8, height=8,
-                            bg=INK_50, highlightthickness=0)
-            dot.pack(side="left", padx=(0, 5), pady=3)
-            dot.create_oval(0, 0, 8, 8, fill=INK_200, outline="")
-
-            nm  = tk.Label(top, text=name, bg=INK_50, fg=INK_900,
-                           font=(FONT, 9, "bold"))
-            nm.pack(side="left")
-
-            sp  = tk.Label(ic, text=spec, bg=INK_50, fg=INK_500,
-                           font=(MONO, 8))
-            sp.pack(anchor="w", pady=(2, 0))
-
-            es  = tk.Label(ic, text=f"예상 감소 {est}", bg=INK_50, fg=INK_400,
-                           font=(FONT, 7))
-            es.pack(anchor="w", pady=(3, 0))
-
-            self._q_cards[qid] = dict(outer=oc, inner=ic, top=top, dot=dot,
-                                       nm=nm, sp=sp, es=es)
-
-            all_widgets = [ic, top, nm, sp, es]
-            for w in all_widgets:
-                w.bind("<Button-1>", lambda e, q=qid: self._set_quality(q))
-                w.bind("<Enter>",    lambda e, q=qid: self._q_hover(q, True))
-                w.bind("<Leave>",    lambda e, q=qid: self._q_hover(q, False))
-
-        self._update_quality_ui()
-
-    def _set_quality(self, qid: str):
-        self.mode.set(qid)
-        self._update_quality_ui()
-
-    def _q_hover(self, qid: str, entering: bool):
-        if qid == self.mode.get():
-            return
-        bg = "#edeae3" if entering else INK_50
-        c  = self._q_cards[qid]
-        for w in [c["inner"], c["top"], c["nm"], c["sp"], c["es"]]:
-            if w.winfo_exists():
-                w.configure(bg=bg)
-        if c["dot"].winfo_exists():
-            c["dot"].configure(bg=bg)
-
-    def _update_quality_ui(self):
-        sel = self.mode.get()
-        for qid, c in self._q_cards.items():
-            active = qid == sel
-            if active:
-                c["outer"].configure(bg=ACCENT)           # 1 px accent border
-                inner_bg = BG_PANEL
-                dot_fill = ACCENT
-                es_fg    = INK_700
-            else:
-                c["outer"].configure(bg=INK_50)
-                inner_bg = INK_50
-                dot_fill = INK_200
-                es_fg    = INK_400
-
-            for w in [c["inner"], c["top"], c["nm"], c["sp"]]:
-                if w.winfo_exists():
-                    w.configure(bg=inner_bg)
-            c["es"].configure(bg=inner_bg, fg=es_fg)
-            c["dot"].configure(bg=inner_bg)
-            c["dot"].delete("all")
-            c["dot"].create_oval(0, 0, 8, 8, fill=dot_fill, outline="")
-
-    # ── Bottom container + three swapping panels ──────────────────────────────
-
-    def _build_bottom_container(self):
-        tk.Frame(self.root, bg=INK_100, height=1).pack(fill="x", side="bottom")
-        self._bottom = tk.Frame(self.root, bg=BG_ACTION)
-        self._bottom.pack(fill="x", side="bottom")
-
-        self._build_action_panel()
-        self._build_progress_panel()
-        self._build_success_panel()
-        self._show_panel("action")
-
-    def _show_panel(self, which: str):
-        for name, frame in [("action",   self._action_panel),
-                             ("progress", self._progress_panel),
-                             ("success",  self._success_panel)]:
-            if name == which:
-                frame.pack(fill="x")
-            else:
-                frame.pack_forget()
-
-    # Action bar
-    def _build_action_panel(self):
-        self._action_panel = tk.Frame(self._bottom, bg=BG_ACTION)
-
-        row = tk.Frame(self._action_panel, bg=BG_ACTION)
-        row.pack(fill="x", padx=24, pady=(12, 14))
-
-        # Save path (left side)
-        sp = tk.Frame(row, bg=BG_ACTION)
-        sp.pack(side="left", fill="x", expand=True)
-
-        # Folder icon
-        fi = tk.Canvas(sp, width=30, height=30,
-                       bg=BG_ACTION, highlightthickness=0)
-        fi.pack(side="left", padx=(0, 8))
-        fi.create_rectangle(1, 9, 29, 25, fill=BG_PANEL, outline=INK_200, width=1)
-        fi.create_rectangle(1, 5, 12, 11, fill=BG_PANEL, outline=INK_200, width=1)
-
-        sp_text = tk.Frame(sp, bg=BG_ACTION)
-        sp_text.pack(side="left")
-
-        tk.Label(sp_text, text="저장 위치",
-                 bg=BG_ACTION, fg=INK_500,
-                 font=(FONT, 7, "bold")).pack(anchor="w")
-
-        path_row = tk.Frame(sp_text, bg=BG_ACTION)
-        path_row.pack(anchor="w")
-
-        self.path_lbl = tk.Label(path_row,
-                                  text=self._shorten_path(self.output_dir),
-                                  bg=BG_ACTION, fg=INK_900,
-                                  font=(MONO, 8))
-        self.path_lbl.pack(side="left")
-
-        change_btn = tk.Label(path_row, text="  변경",
-                              bg=BG_ACTION, fg=ACCENT,
-                              font=(FONT, 8, "bold"), cursor="hand2")
-        change_btn.pack(side="left")
-        change_btn.bind("<Button-1>", lambda _e: self._change_output_dir())
-
-        # Compress button (right)
-        self.compress_btn = tk.Button(
-            row,
-            text="PDF 압축 시작  →",
-            bg=ACCENT, fg="white",
-            activebackground=ACCENT_DK, activeforeground="white",
-            font=(FONT, 10, "bold"),
-            relief="flat", cursor="hand2",
-            padx=18, pady=8,
-            command=self._start_compression,
-        )
-        self.compress_btn.pack(side="right")
-
-    # Progress panel
-    def _build_progress_panel(self):
-        self._progress_panel = tk.Frame(self._bottom, bg=BG_ACTION)
-
-        inner = tk.Frame(self._progress_panel, bg=BG_ACTION)
-        inner.pack(fill="x", padx=24, pady=(12, 14))
-
-        # Top row: dot + status text + percentage
-        top_row = tk.Frame(inner, bg=BG_ACTION)
-        top_row.pack(fill="x", pady=(0, 8))
-
-        left = tk.Frame(top_row, bg=BG_ACTION)
-        left.pack(side="left")
-
-        self._prog_dot = tk.Canvas(left, width=6, height=6,
-                                    bg=BG_ACTION, highlightthickness=0)
-        self._prog_dot.pack(side="left", padx=(0, 6), pady=3)
-        self._prog_dot.create_oval(0, 0, 6, 6, fill=ACCENT, outline="")
-
-        self._status_lbl = tk.Label(left, text="준비 중...",
-                                     bg=BG_ACTION, fg=INK_900,
-                                     font=(FONT, 9, "bold"))
-        self._status_lbl.pack(side="left")
-
-        self._pct_lbl = tk.Label(top_row, text="0%",
-                                  bg=BG_ACTION, fg=ACCENT,
-                                  font=(MONO, 9, "bold"))
-        self._pct_lbl.pack(side="right")
-
-        # Progress bar
-        self.progress_var = tk.DoubleVar(value=0)
-        self.progress_bar = ttk.Progressbar(
-            inner, variable=self.progress_var,
-            style="Accent.Horizontal.TProgressbar",
-            mode="determinate",
-        )
-        self.progress_bar.pack(fill="x", pady=(0, 8))
-
-        # Sub row: file counter + ETA
-        sub = tk.Frame(inner, bg=BG_ACTION)
-        sub.pack(fill="x")
-        self._sub_left  = tk.Label(sub, text="", bg=BG_ACTION, fg=INK_500,
-                                    font=(MONO, 8))
-        self._sub_left.pack(side="left")
-        self._sub_right = tk.Label(sub, text="", bg=BG_ACTION, fg=INK_500,
-                                    font=(MONO, 8))
-        self._sub_right.pack(side="right")
-
-    # Success panel
-    def _build_success_panel(self):
-        self._success_panel = tk.Frame(self._bottom, bg=SUCCESS_BG)
-
-        inner = tk.Frame(self._success_panel, bg=SUCCESS_BG)
-        inner.pack(fill="x", padx=24, pady=(12, 14))
-
-        # Check circle
-        chk = tk.Canvas(inner, width=36, height=36,
-                        bg=SUCCESS_BG, highlightthickness=0)
-        chk.pack(side="left", padx=(0, 14))
-        chk.create_oval(0, 0, 36, 36, fill=SUCCESS, outline="")
-        chk.create_line(8, 18, 15, 26, 28, 10,
-                        fill="white", width=3,
-                        joinstyle="round", capstyle="round")
-
-        msg = tk.Frame(inner, bg=SUCCESS_BG)
-        msg.pack(side="left", fill="x", expand=True)
-
-        self._done_title = tk.Label(msg, text="",
-                                     bg=SUCCESS_BG, fg=SUCCESS_DK,
-                                     font=(FONT, 11, "bold"))
-        self._done_title.pack(anchor="w")
-
-        self._done_stats = tk.Label(msg, text="",
-                                     bg=SUCCESS_BG, fg=SUCCESS_MID,
-                                     font=(MONO, 8))
-        self._done_stats.pack(anchor="w", pady=(2, 0))
-
-        open_btn = tk.Button(
-            inner,
-            text="📁  결과 폴더 열기  →",
-            bg=BG_PANEL, fg=SUCCESS_DK,
-            activebackground="#eef8f1", activeforeground=SUCCESS_DK,
-            font=(FONT, 9, "bold"),
-            relief="groove", cursor="hand2",
-            padx=12, pady=5,
-            command=self._open_output_dir,
-        )
-        open_btn.pack(side="right")
-
-    # ── Status rail ──────────────────────────────────────────────────────────
-
-    def _build_status_rail(self):
-        tk.Frame(self.root, bg=INK_100, height=1).pack(fill="x", side="bottom")
-        rail = tk.Frame(self.root, bg=BG_TITLEBAR)
-        rail.pack(fill="x", side="bottom")
-
-        tk.Label(rail, text="● 오프라인 모드",
-                 bg=BG_TITLEBAR, fg=SUCCESS,
-                 font=(FONT, 7)).pack(side="left", padx=14, pady=5)
-
-        py_ver  = f"Python {sys.version_info.major}.{sys.version_info.minor}"
-        r_txt   = f"{py_ver} · PyMuPDF · pikepdf   {APP_VERSION}"
-        tk.Label(rail, text=r_txt,
-                 bg=BG_TITLEBAR, fg=INK_500,
-                 font=(MONO, 7)).pack(side="right", padx=14, pady=5)
-
-    # ── Event handlers ───────────────────────────────────────────────────────
+            self.showMaximized()
+
+    # App header
+    def _build_app_header(self) -> QWidget:
+        hdr = QFrame()
+        hdr.setObjectName("appHeader")
+
+        lay = QHBoxLayout(hdr)
+        lay.setContentsMargins(24, 18, 24, 16)
+        lay.setSpacing(12)
+
+        mark = BrandMark()
+        lay.addWidget(mark)
+
+        tf = QVBoxLayout(); tf.setSpacing(2); tf.setContentsMargins(0, 0, 0, 0)
+        t1 = QLabel("PDF 압축기");            t1.setObjectName("brandTitle")
+        t2 = QLabel("오프라인 · 원본 보존 · 배치 처리"); t2.setObjectName("brandSubtitle")
+        tf.addWidget(t1); tf.addWidget(t2)
+        wrap = QWidget(); wrap.setLayout(tf)
+        lay.addWidget(wrap)
+        lay.addStretch(1)
+        return hdr
+
+    # Main content area (drop zone + file list + quality)
+    def _build_main(self) -> QWidget:
+        wrap = QWidget()
+        lay = QVBoxLayout(wrap)
+        lay.setContentsMargins(24, 20, 24, 20)
+        lay.setSpacing(18)
+
+        # Drop zone
+        self.dropzone = DropZone()
+        self.dropzone.clicked.connect(self._browse_files)
+        self.dropzone.filesDropped.connect(self._add_files)
+        lay.addWidget(self.dropzone)
+
+        # File list section
+        file_section = QVBoxLayout(); file_section.setSpacing(8); file_section.setContentsMargins(0, 0, 0, 0)
+
+        sh = QHBoxLayout(); sh.setContentsMargins(0, 0, 0, 0)
+        lbl = QLabel("파일 목록"); lbl.setObjectName("sectionHead")
+        self.count_lbl = QLabel("0개 파일"); self.count_lbl.setObjectName("sectionCount")
+        sh.addWidget(lbl); sh.addStretch(1); sh.addWidget(self.count_lbl)
+        sh_w = QWidget(); sh_w.setLayout(sh)
+        file_section.addWidget(sh_w)
+
+        # File list wrap — table and empty_state share the same space (QStackedLayout)
+        list_wrap = QFrame(); list_wrap.setObjectName("fileListWrap")
+        list_wrap.setMinimumHeight(220)
+        list_stack = QStackedLayout(list_wrap)
+        list_stack.setContentsMargins(0, 0, 0, 0)
+
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["파일명", "원본 크기", "압축 크기", "압축률", ""])
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.setShowGrid(False)
+        self.table.setFrameShape(QFrame.Shape.NoFrame)
+        self.table.verticalHeader().setDefaultSectionSize(34)
+        self.table.setMinimumHeight(200)
+        hdr = self.table.horizontalHeader()
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
+        hdr.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
+        self.table.setColumnWidth(1, 100)
+        self.table.setColumnWidth(2, 100)
+        self.table.setColumnWidth(3, 110)
+        self.table.setColumnWidth(4, 28)
+        self.table.setHorizontalHeaderItem(1, QTableWidgetItem("원본 크기"))
+        self.table.setHorizontalHeaderItem(2, QTableWidgetItem("압축 크기"))
+        self.table.setHorizontalHeaderItem(3, QTableWidgetItem("압축률"))
+        for i in (1, 2, 3):
+            self.table.horizontalHeaderItem(i).setTextAlignment(
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        # Empty-state overlay (shown when no files)
+        self.empty_state = QFrame(); self.empty_state.setObjectName("emptyState")
+        es_lay = QVBoxLayout(self.empty_state)
+        es_lay.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        es_lay.setSpacing(10)
+        es_icon = QLabel("⋮⋮"); es_icon.setObjectName("emptyStateIcon")
+        es_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        es_txt = QLabel("위에 PDF 파일을 드래그해서 시작하세요")
+        es_txt.setObjectName("emptyStateText")
+        es_txt.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        es_lay.addWidget(es_icon); es_lay.addWidget(es_txt)
+
+        # Stack: empty_state (index 0) under table (index 1), same geometry
+        list_stack.addWidget(self.empty_state)
+        list_stack.addWidget(self.table)
+        self._list_stack = list_stack
+        list_stack.setCurrentIndex(0)  # start with empty state
+
+        file_section.addWidget(list_wrap)
+        fs_w = QWidget(); fs_w.setLayout(file_section)
+        lay.addWidget(fs_w, 1)
+
+        # Quality panel
+        q_row = QHBoxLayout(); q_row.setSpacing(14); q_row.setContentsMargins(0, 0, 0, 0)
+        q_lbl = QLabel("압축 수준"); q_lbl.setObjectName("qualityLabel")
+        q_row.addWidget(q_lbl)
+
+        q_seg = QFrame(); q_seg.setObjectName("qualitySeg")
+        q_seg_lay = QHBoxLayout(q_seg); q_seg_lay.setContentsMargins(4, 4, 4, 4); q_seg_lay.setSpacing(6)
+        self._q_cards = {}
+        specs = [
+            QualityCard.Spec("extreme",     "최대 압축", "900px · Q35",  "70–90%"),
+            QualityCard.Spec("recommended", "권장",      "1600px · Q65", "40–70%"),
+            QualityCard.Spec("low",         "저압축",    "2400px · Q85", "20–40%"),
+        ]
+        for sp in specs:
+            card = QualityCard(sp)
+            card.clicked.connect(lambda _=False, q=sp.qid: self._set_quality(q))
+            q_seg_lay.addWidget(card, 1)
+            self._q_cards[sp.qid] = card
+
+        q_row.addWidget(q_seg, 1)
+        qw = QWidget(); qw.setLayout(q_row)
+        lay.addWidget(qw)
+
+        self._set_quality(self.current_mode)
+
+        # Table row deletion
+        self.table.keyPressEvent = self._table_keypress
+        return wrap
+
+    def _table_keypress(self, ev):
+        if ev.key() == Qt.Key.Key_Delete and not self.is_compressing:
+            self._remove_selected_rows()
+        else:
+            QTableWidget.keyPressEvent(self.table, ev)
+
+    # Bottom stack (action/progress/success)
+    def _build_bottom_stack(self) -> QWidget:
+        self.bottom_stack = QStackedWidget()
+
+        # Action panel
+        self.action_panel = QFrame(); self.action_panel.setObjectName("actionBar")
+        ab = QHBoxLayout(self.action_panel); ab.setContentsMargins(24, 16, 24, 16); ab.setSpacing(16)
+
+        sp_row = QHBoxLayout(); sp_row.setSpacing(10); sp_row.setContentsMargins(0, 0, 0, 0)
+        sp_row.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+        sp_icon = QLabel("📁"); sp_icon.setObjectName("spIcon")
+        sp_icon.setFixedSize(26, 26); sp_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        sp_row.addWidget(sp_icon, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        sp_txt_lay = QVBoxLayout(); sp_txt_lay.setSpacing(1); sp_txt_lay.setContentsMargins(0, 0, 0, 0)
+        sp_txt_lay.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+        sp_lbl = QLabel("저장 위치"); sp_lbl.setObjectName("spLabel")
+        sp_val_row = QHBoxLayout(); sp_val_row.setSpacing(6); sp_val_row.setContentsMargins(0, 0, 0, 0)
+        self.path_lbl = QLabel(self._shorten_path(self.output_dir)); self.path_lbl.setObjectName("spValue")
+        change_btn = QPushButton("변경"); change_btn.setObjectName("spChange")
+        change_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        change_btn.clicked.connect(self._change_output_dir)
+        sp_val_row.addWidget(self.path_lbl); sp_val_row.addWidget(change_btn); sp_val_row.addStretch(1)
+        sp_val_w = QWidget(); sp_val_w.setLayout(sp_val_row)
+        sp_txt_lay.addWidget(sp_lbl); sp_txt_lay.addWidget(sp_val_w)
+        sp_txt_w = QWidget(); sp_txt_w.setLayout(sp_txt_lay)
+        sp_row.addWidget(sp_txt_w, 1)
+
+        sp_w = QWidget(); sp_w.setLayout(sp_row)
+        sp_w.setMaximumWidth(520)
+        ab.addWidget(sp_w, 1)
+
+        self.compress_btn = QPushButton("PDF 압축 시작  →")
+        self.compress_btn.setObjectName("btnCompress")
+        self.compress_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.compress_btn.clicked.connect(self._start_compression)
+        ab.addWidget(self.compress_btn)
+
+        # Progress panel
+        self.progress_panel = QFrame(); self.progress_panel.setObjectName("progressPanel")
+        pp = QVBoxLayout(self.progress_panel); pp.setContentsMargins(24, 14, 24, 18); pp.setSpacing(10)
+
+        pp_top = QHBoxLayout(); pp_top.setSpacing(8)
+        self.pulse_dot = PulsingDot()
+        pp_top.addWidget(self.pulse_dot)
+        self.pp_status = QLabel("준비 중..."); self.pp_status.setObjectName("progressStatus")
+        pp_top.addWidget(self.pp_status)
+        self.pp_file = QLabel(""); self.pp_file.setObjectName("progressFile")
+        pp_top.addWidget(self.pp_file, 1)
+        self.pp_pct = QLabel("0%"); self.pp_pct.setObjectName("progressPct")
+        pp_top.addWidget(self.pp_pct)
+        pp_top_w = QWidget(); pp_top_w.setLayout(pp_top)
+        pp.addWidget(pp_top_w)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setTextVisible(False)
+        self.progress_bar.setRange(0, 100)
+        pp.addWidget(self.progress_bar)
+
+        pp_sub = QHBoxLayout()
+        self.pp_sub_left = QLabel(""); self.pp_sub_left.setObjectName("progressSub")
+        self.pp_sub_right = QLabel(""); self.pp_sub_right.setObjectName("progressSub")
+        pp_sub.addWidget(self.pp_sub_left); pp_sub.addStretch(1); pp_sub.addWidget(self.pp_sub_right)
+        pp_sub_w = QWidget(); pp_sub_w.setLayout(pp_sub)
+        pp.addWidget(pp_sub_w)
+
+        # Success panel
+        self.success_panel = QFrame(); self.success_panel.setObjectName("successPanel")
+        sp = QHBoxLayout(self.success_panel); sp.setContentsMargins(32, 16, 32, 18); sp.setSpacing(16)
+        self.success_check = CheckIcon()
+        sp.addWidget(self.success_check)
+        sp_msg_lay = QVBoxLayout(); sp_msg_lay.setSpacing(2); sp_msg_lay.setContentsMargins(0, 0, 0, 0)
+        self.success_title = QLabel(""); self.success_title.setObjectName("successTitle")
+        self.success_stats = QLabel(""); self.success_stats.setObjectName("successStats")
+        self.success_stats.setTextFormat(Qt.TextFormat.RichText)
+        sp_msg_lay.addWidget(self.success_title); sp_msg_lay.addWidget(self.success_stats)
+        sp_msg_w = QWidget(); sp_msg_w.setLayout(sp_msg_lay)
+        sp.addWidget(sp_msg_w, 1)
+        new_btn = QPushButton("＋  새 압축"); new_btn.setObjectName("btnNewRun")
+        new_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        new_btn.clicked.connect(self._start_new_run)
+        sp.addWidget(new_btn)
+        open_btn = QPushButton("📁  결과 폴더 열기  →"); open_btn.setObjectName("btnOpenFolder")
+        open_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        open_btn.clicked.connect(self._open_output_dir)
+        sp.addWidget(open_btn)
+
+        self.bottom_stack.addWidget(self.action_panel)
+        self.bottom_stack.addWidget(self.progress_panel)
+        self.bottom_stack.addWidget(self.success_panel)
+
+        # Only the currently visible panel contributes to height — others ignored
+        for p in (self.action_panel, self.progress_panel, self.success_panel):
+            p.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Ignored)
+        self.action_panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+
+        def _on_stack_changed(idx):
+            for i in range(self.bottom_stack.count()):
+                w = self.bottom_stack.widget(i)
+                w.setSizePolicy(
+                    QSizePolicy.Policy.Expanding,
+                    QSizePolicy.Policy.Preferred if i == idx else QSizePolicy.Policy.Ignored,
+                )
+                w.adjustSize()
+            self.bottom_stack.adjustSize()
+
+        self.bottom_stack.currentChanged.connect(_on_stack_changed)
+        self.bottom_stack.setCurrentWidget(self.action_panel)
+        return self.bottom_stack
+
+    # Status rail
+    def _build_status_rail(self) -> QWidget:
+        rail = QFrame(); rail.setObjectName("statusRail"); rail.setFixedHeight(28)
+        lay = QHBoxLayout(rail); lay.setContentsMargins(16, 6, 16, 6); lay.setSpacing(6)
+
+        dot = QFrame(); dot.setObjectName("railDot")
+        lay.addWidget(dot)
+        chip = QLabel("오프라인 모드"); chip.setObjectName("railChip")
+        lay.addWidget(chip)
+        lay.addStretch(1)
+
+        py_ver = f"Python {sys.version_info.major}.{sys.version_info.minor}"
+        right = QLabel(f"{py_ver} · PyMuPDF · pikepdf        {S.APP_VERSION}")
+        right.setObjectName("railRight")
+        lay.addWidget(right)
+        return rail
+
+    # ── Frameless window drag ────────────────────────────────────────────────
+
+    def mousePressEvent(self, ev: QMouseEvent):
+        if ev.button() == Qt.MouseButton.LeftButton and self._is_in_titlebar(ev.pos()):
+            self._drag_pos = ev.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            ev.accept()
+
+    def mouseMoveEvent(self, ev: QMouseEvent):
+        if self._drag_pos is not None and ev.buttons() & Qt.MouseButton.LeftButton:
+            self.move(ev.globalPosition().toPoint() - self._drag_pos)
+            ev.accept()
+
+    def mouseReleaseEvent(self, _ev):
+        self._drag_pos = None
+
+    def _is_in_titlebar(self, pos: QPoint) -> bool:
+        if not hasattr(self, "_titlebar"):
+            return False
+        tb_rect = self._titlebar.rect()
+        tb_global = self._titlebar.mapTo(self, tb_rect.topLeft())
+        return (tb_global.y() <= pos.y() <= tb_global.y() + tb_rect.height()
+                and pos.x() < self._titlebar.width() - 3 * 46)
+
+    # ── File management ──────────────────────────────────────────────────────
 
     def _browse_files(self):
         if self.is_compressing:
             return
-        paths = filedialog.askopenfilenames(
-            title="PDF 파일 선택",
-            filetypes=[("PDF 파일", "*.pdf"), ("모든 파일", "*.*")],
-        )
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "PDF 파일 선택", "",
+            "PDF 파일 (*.pdf);;모든 파일 (*.*)")
         if paths:
-            self._add_files(list(paths))
+            self._add_files(paths)
 
-    def _on_dnd_drop(self, event):
-        if self.is_compressing:
-            return
-        raw: str = event.data
-        if "{" in raw:
-            paths = re.findall(r"\{([^}]+)\}", raw)
-        else:
-            paths = raw.split()
-        valid = [p for p in paths
-                 if p.lower().endswith(".pdf") and os.path.isfile(p)]
-        self._add_files(valid)
-        self._draw_drop_zone(active=False)
-
-    def _add_files(self, paths: list):
+    @pyqtSlot(list)
+    def _add_files(self, paths: list[str]):
+        existing = {f["path"] for f in self.files}
         for path in paths:
-            if path in self.files or not path.lower().endswith(".pdf"):
+            if path in existing or not path.lower().endswith(".pdf"):
                 continue
             size = os.path.getsize(path)
-            iid  = self.tree.insert("", "end",
-                                    values=(os.path.basename(path),
-                                            format_size(size),
-                                            "—", "—"),
-                                    tags=("pending",))
-            self.files[path] = {"original_size": size,
-                                 "compressed_size": None,
-                                 "tree_id": iid}
-        self._update_count_label()
+            row = self.table.rowCount()
+            self.table.insertRow(row)
 
-    def _update_count_label(self):
-        n     = len(self.files)
-        total = sum(v["original_size"] for v in self.files.values())
-        self.count_lbl.configure(
-            text=(f"{n}개 파일  ·  총 {format_size(total)}" if n else "0개 파일"))
+            name_cell = FileNameCell(os.path.basename(path))
+            self.table.setCellWidget(row, 0, name_cell)
 
-    def _remove_selected(self, _event=None):
+            orig_item = QTableWidgetItem(format_size(size))
+            orig_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            orig_item.setForeground(QBrush(QColor(S.INK_700)))
+            f = orig_item.font(); f.setFamily("Consolas"); f.setPointSize(9); orig_item.setFont(f)
+            self.table.setItem(row, 1, orig_item)
+
+            comp_item = QTableWidgetItem("—")
+            comp_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            comp_item.setForeground(QBrush(QColor(S.INK_300)))
+            comp_item.setFont(f)
+            self.table.setItem(row, 2, comp_item)
+
+            ratio = RatioBar()
+            self.table.setCellWidget(row, 3, ratio)
+
+            remove = QPushButton("✕")
+            remove.setFlat(True)
+            remove.setStyleSheet(f"color: {S.INK_400}; border: 0; background: transparent;"
+                                  f"font-size: 11px;")
+            remove.setCursor(Qt.CursorShape.PointingHandCursor)
+            remove.clicked.connect(lambda _=False, p=path: self._remove_by_path(p))
+            self.table.setCellWidget(row, 4, remove)
+
+            self.files.append({
+                "path": path,
+                "size": size,
+                "comp_size": None,
+                "row": row,
+                "ratio_widget": ratio,
+                "comp_item": comp_item,
+            })
+        self._update_count()
+
+    def _remove_by_path(self, path: str):
         if self.is_compressing:
             return
-        for iid in self.tree.selection():
-            for path, info in list(self.files.items()):
-                if info["tree_id"] == iid:
-                    del self.files[path]
+        for i, f in enumerate(self.files):
+            if f["path"] == path:
+                self.table.removeRow(f["row"])
+                del self.files[i]
+                break
+        self._reindex_rows()
+        self._update_count()
+
+    def _remove_selected_rows(self):
+        sel_rows = sorted({i.row() for i in self.table.selectedIndexes()}, reverse=True)
+        for r in sel_rows:
+            for i, f in enumerate(self.files):
+                if f["row"] == r:
+                    self.table.removeRow(r)
+                    del self.files[i]
                     break
-            self.tree.delete(iid)
-        self._update_count_label()
+        self._reindex_rows()
+        self._update_count()
+
+    def _reindex_rows(self):
+        for i, f in enumerate(self.files):
+            f["row"] = i
+
+    def _update_count(self):
+        n = len(self.files)
+        if n == 0:
+            self.count_lbl.setText("0개 파일")
+        else:
+            total = sum(f["size"] for f in self.files)
+            self.count_lbl.setText(f"{n}개 파일  ·  총 {format_size(total)}")
+        # Toggle empty state vs table via stacked layout (fixed box size)
+        self._list_stack.setCurrentIndex(0 if n == 0 else 1)
+        # Enable compress button only when there are files and not compressing
+        if hasattr(self, "compress_btn"):
+            self.compress_btn.setEnabled(n > 0 and not self.is_compressing)
 
     def _change_output_dir(self):
-        path = filedialog.askdirectory(title="저장 위치 선택",
-                                       initialdir=self.output_dir)
+        path = QFileDialog.getExistingDirectory(
+            self, "저장 위치 선택", self.output_dir)
         if path:
             self.output_dir = path
-            self.path_lbl.configure(text=self._shorten_path(path))
+            self.path_lbl.setText(self._shorten_path(path))
+
+    # ── Quality ──────────────────────────────────────────────────────────────
+
+    def _set_quality(self, qid: str):
+        self.current_mode = qid
+        for k, card in self._q_cards.items():
+            card.setActive(k == qid)
+
+    # ── Compression lifecycle ────────────────────────────────────────────────
 
     def _start_compression(self):
         if self.is_compressing:
             return
         if not self.files:
-            messagebox.showwarning("파일 없음", "압축할 PDF 파일을 먼저 추가하세요.")
+            QMessageBox.warning(self, "파일 없음", "압축할 PDF 파일을 먼저 추가하세요.")
             return
 
         ensure_dir(self.output_dir)
         self.is_compressing = True
-        self.compress_btn.configure(state="disabled", bg=INK_300)
+        self.compress_btn.setDisabled(True)
 
-        for path, info in self.files.items():
-            self.tree.item(info["tree_id"],
-                           values=(os.path.basename(path),
-                                   format_size(info["original_size"]),
-                                   "—", "—"),
-                           tags=("pending",))
-            info["compressed_size"] = None
+        # Reset state
+        for f in self.files:
+            f["ratio_widget"].set_pending()
+            f["comp_item"].setText("—")
+            f["comp_item"].setForeground(QBrush(QColor(S.INK_300)))
+            f["comp_size"] = None
 
-        self.progress_var.set(0)
-        self._status_lbl.configure(text="준비 중...")
-        self._pct_lbl.configure(text="0%")
-        self._sub_left.configure(text="")
-        self._sub_right.configure(text="")
-        self._show_panel("progress")
-        self._start_dot_anim()
+        self.progress_bar.setValue(0)
+        self.pp_status.setText("준비 중...")
+        self.pp_file.setText("")
+        self.pp_pct.setText("0%")
+        self.pp_sub_left.setText("")
+        self.pp_sub_right.setText("")
+        self.bottom_stack.setCurrentWidget(self.progress_panel)
+        self.pulse_dot.start()
 
-        threading.Thread(target=self._worker, daemon=True).start()
+        entries = [(f["row"], f["path"]) for f in self.files]
+        self._worker = CompressionWorker(entries, self.current_mode, self.output_dir)
+        self._worker.fileStarted.connect(self._on_file_started)
+        self._worker.fileProgress.connect(self._on_file_progress)
+        self._worker.fileDone.connect(self._on_file_done)
+        self._worker.fileError.connect(self._on_file_error)
+        self._worker.allDone.connect(self._on_all_done)
+        self._worker.start()
 
-    # ── Progress dot animation ────────────────────────────────────────────────
+    @pyqtSlot(int, str)
+    def _on_file_started(self, idx: int, fname: str):
+        self.pp_status.setText("처리 중:")
+        self.pp_file.setText(fname)
+        for f in self.files:
+            if f["row"] == idx:
+                f["ratio_widget"].set_working()
+                break
+        total = len(self.files)
+        done_n = sum(1 for f in self.files if f["comp_size"] is not None) + 1
+        self.pp_sub_left.setText(f"{done_n} / {total} 파일")
 
-    def _start_dot_anim(self):
-        self._dot_phase = 0
-        self._animate_dot()
+    @pyqtSlot(int, float)
+    def _on_file_progress(self, _idx: int, pct: float):
+        self.progress_bar.setValue(int(pct))
+        self.pp_pct.setText(f"{pct:.0f}%")
+        remaining = max(0, int((100 - pct) / max(pct / 5, 1)))
+        self.pp_sub_right.setText(f"예상 남은 시간: {remaining}초")
 
-    def _animate_dot(self):
-        if not self.is_compressing:
-            return
-        phase  = self._dot_phase % 20
-        alpha  = phase / 10.0 if phase < 10 else (20 - phase) / 10.0
-        # Interpolate between dim (#f0a99f) and bright (#e05543)
-        r = int(0xf0 + (0xe0 - 0xf0) * alpha)
-        g = int(0xa9 + (0x55 - 0xa9) * alpha)
-        b = int(0x9f + (0x43 - 0x9f) * alpha)
-        col = f"#{r:02x}{g:02x}{b:02x}"
-        self._prog_dot.delete("all")
-        self._prog_dot.create_oval(0, 0, 6, 6, fill=col, outline="")
-        self._dot_phase += 1
-        self._dot_anim_id = self.root.after(60, self._animate_dot)
+    @pyqtSlot(int, int, int, float)
+    def _on_file_done(self, idx: int, in_sz: int, out_sz: int, ratio: float):
+        for f in self.files:
+            if f["row"] == idx:
+                f["comp_size"] = out_sz
+                f["comp_item"].setText(format_size(out_sz))
+                f["comp_item"].setForeground(QBrush(QColor(S.INK_900)))
+                fnt = f["comp_item"].font(); fnt.setBold(True); f["comp_item"].setFont(fnt)
+                f["ratio_widget"].set_done(ratio)
+                break
 
-    # ── Background worker ─────────────────────────────────────────────────────
+    @pyqtSlot(int, str)
+    def _on_file_error(self, idx: int, _msg: str):
+        for f in self.files:
+            if f["row"] == idx:
+                f["comp_item"].setText("오류")
+                f["comp_item"].setForeground(QBrush(QColor(S.ACCENT)))
+                f["ratio_widget"].set_error()
+                break
 
-    def _worker(self):
-        entries     = list(self.files.items())
-        total_files = len(entries)
-        total_orig  = 0
-        total_comp  = 0
-        mode        = self.mode.get()
-
-        for fi, (path, info) in enumerate(entries):
-            fname = os.path.basename(path)
-
-            def _ui_start(fn=fname, i=fi, n=total_files):
-                self._status_lbl.configure(text=f"처리 중: {fn}")
-                self._sub_left.configure(text=f"{i + 1} / {n} 파일")
-
-            self.root.after(0, _ui_start)
-
-            out_path = get_output_path(path, self.output_dir)
-
-            def _make_cb(fi_=fi, n_=total_files):
-                def cb(cur, tot):
-                    pct = (fi_ + cur / tot) / n_ * 100
-                    rem = max(0, int((100 - pct) / max(pct / max(fi_ + 1, 1), 0.1)))
-
-                    def _upd(p=pct, r=rem):
-                        self.progress_var.set(p)
-                        self._pct_lbl.configure(text=f"{p:.0f}%")
-                        self._sub_right.configure(text=f"예상 남은 시간: {r}초")
-
-                    self.root.after(0, _upd)
-
-                return cb
-
-            try:
-                in_sz, out_sz = compress_pdf(path, out_path, mode, _make_cb())
-                total_orig += in_sz
-                total_comp += out_sz
-                ratio = (1 - out_sz / in_sz) * 100 if in_sz else 0
-
-                def _upd_row(iid=info["tree_id"], p=path,
-                             s=in_sz, o=out_sz, r=ratio):
-                    self.tree.item(iid,
-                                   values=(os.path.basename(p),
-                                           format_size(s),
-                                           format_size(o),
-                                           f"−{r:.1f}%"),
-                                   tags=("done",))
-                    self.files[p]["compressed_size"] = o
-
-                self.root.after(0, _upd_row)
-
-            except Exception:
-                def _err_row(iid=info["tree_id"], p=path,
-                             s=info["original_size"]):
-                    self.tree.item(iid,
-                                   values=(os.path.basename(p),
-                                           format_size(s),
-                                           "오류", ""),
-                                   tags=("error",))
-
-                self.root.after(0, _err_row)
-
-        self.root.after(0, self._on_done, total_files, total_orig, total_comp)
-
-    def _on_done(self, n_files: int, total_orig: int, total_comp: int):
+    @pyqtSlot(int, int, int)
+    def _on_all_done(self, n_files: int, tot_orig: int, tot_comp: int):
         self.is_compressing = False
-        self.compress_btn.configure(state="normal", bg=ACCENT)
-        self.progress_var.set(100)
+        self.compress_btn.setDisabled(False)
+        self.pulse_dot.stop()
 
-        if self._dot_anim_id:
-            self.root.after_cancel(self._dot_anim_id)
-            self._dot_anim_id = None
-
-        ratio = (1 - total_comp / total_orig) * 100 if total_orig else 0
-        saved = total_orig - total_comp
-        self._done_title.configure(text=f"{n_files}개 파일 압축 완료")
-        self._done_stats.configure(
-            text=(f"{format_size(total_orig)}  →  {format_size(total_comp)}"
-                  f"    −{ratio:.1f}%  ({format_size(saved)} 절약)"))
-        self._show_panel("success")
+        ratio = (1 - tot_comp / tot_orig) * 100 if tot_orig else 0
+        saved = tot_orig - tot_comp
+        self.success_title.setText(f"{n_files}개 파일 압축 완료")
+        self.success_stats.setText(
+            f"<span id='successStatsStrong' style='color:{S.SUCCESS_DK};font-weight:700'>"
+            f"{format_size(tot_orig)}</span>"
+            f" <span style='color:{S.INK_400}'>→</span> "
+            f"<span style='color:{S.SUCCESS_DK};font-weight:700'>{format_size(tot_comp)}</span>"
+            f"     <span style='color:{S.SUCCESS};font-weight:700'>−{ratio:.1f}% "
+            f"({format_size(saved)} 절약)</span>"
+        )
+        self.bottom_stack.setCurrentWidget(self.success_panel)
 
     def _open_output_dir(self):
         try:
             os.startfile(self.output_dir)
         except Exception:
             pass
+
+    def _start_new_run(self):
+        """Reset UI to action panel so user can add/compress new files."""
+        # Clear previously compressed files from the list
+        self.table.setRowCount(0)
+        self.files.clear()
+        self._update_count()
+        self.bottom_stack.setCurrentWidget(self.action_panel)
