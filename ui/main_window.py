@@ -483,25 +483,12 @@ class MainWindow(QMainWindow):
         self._worker: Optional[CompressionWorker] = None
         self._drag_pos: Optional[QPoint] = None
 
-        gs = find_ghostscript()
-        self._has_gs = bool(gs)
-        self._gs_ver = self._detect_gs_ver(gs) if gs else None
+        self._has_gs = bool(find_ghostscript())
 
         self._build_ui()
         self.setStyleSheet(S.QSS)
 
     # ── Utilities ────────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _detect_gs_ver(gs_path: str) -> str:
-        try:
-            import subprocess
-            r = subprocess.run([gs_path, "--version"],
-                               capture_output=True, text=True, timeout=3)
-            m = re.search(r"(\d+\.\d+[\.\d]*)", r.stdout)
-            return f"v{m.group(1)}" if m else "v10"
-        except Exception:
-            return "v10"
 
     @staticmethod
     def _shorten_path(p: str, max_len: int = 50) -> str:

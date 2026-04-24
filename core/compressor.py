@@ -238,6 +238,11 @@ def _compress_ghostscript(gs_path: str, input_path: str, output_path: str,
         input_path,
     ]
 
+    # Windows: hide console window that would flash when GS launches
+    creationflags = 0
+    if sys.platform == "win32":
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -247,6 +252,7 @@ def _compress_ghostscript(gs_path: str, input_path: str, output_path: str,
         errors="replace",
         env=_gs_env(gs_path),
         cwd=os.path.dirname(os.path.abspath(gs_path)),  # gsdll64.dll 탐색 안정화
+        creationflags=creationflags,
     )
 
     current_page = 0

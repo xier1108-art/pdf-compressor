@@ -1,6 +1,6 @@
 @echo off
 echo ================================================
-echo  PDF 압축기 - 단일 .exe 빌드 (Ghostscript 포함)
+echo  PDF 압축기 - 폴더형 빌드 (즉시 실행 / Ghostscript 포함)
 echo ================================================
 echo.
 
@@ -19,9 +19,12 @@ if "%GS_DIR%"=="" (
     set ADD_GS=--add-data "%GS_DIR%;gs"
 )
 
-pyinstaller --onefile --windowed ^
+:: --onedir 로 빌드 (--onefile 대비 실행 시작 속도가 10배 이상 빠름)
+:: --contents-directory=_internal 로 런타임 파일을 한 폴더에 모아 배포 용이
+pyinstaller --onedir --windowed ^
     --name "PDF압축기" ^
     --icon "assets\icon.ico" ^
+    --contents-directory "_internal" ^
     --collect-all pymupdf ^
     --collect-all pikepdf ^
     --collect-all PyQt6 ^
@@ -38,6 +41,9 @@ if %errorlevel% neq 0 (
 echo.
 echo ================================================
 echo  빌드 완료!
-echo  실행 파일: dist\PDF압축기.exe
+echo  실행 폴더: dist\PDF압축기\
+echo  실행 파일: dist\PDF압축기\PDF압축기.exe
+echo.
+echo  배포 시: dist\PDF압축기 폴더 전체를 ZIP으로 묶어 배포
 echo ================================================
 pause
