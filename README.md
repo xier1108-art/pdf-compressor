@@ -18,8 +18,11 @@ Ghostscript 엔진을 사용해 이미지 재압축, 폰트 서브셋, 불필요
 
 ## 다운로드 (바로 실행)
 
-> [**Releases**](../../releases) 탭에서 `PDF압축기.exe` 를 다운로드하세요.  
+> [**Releases**](../../releases) 탭에서 `PDF압축기_vX.X.X.zip` 을 다운로드하세요.  
+> 원하는 위치에 압축 해제 후 `PDF압축기` 폴더 내 `PDF압축기.exe` 를 실행하면 됩니다.  
 > Python 설치 없이 바로 실행 가능합니다.
+>
+> 폴더 전체를 보관해야 합니다. `.exe` 파일만 꺼내면 실행되지 않습니다.
 
 ---
 
@@ -66,7 +69,8 @@ python app.py
 build.bat
 ```
 
-빌드 결과물: `dist/PDF압축기.exe`  
+빌드 결과물: `dist/PDF압축기/` 폴더 (`PDF압축기.exe` + `_internal/` 의존성)  
+배포 시에는 폴더 전체를 ZIP으로 묶어 공유하세요.  
 Python이 설치되어 있어야 합니다.
 
 ---
