@@ -1,4 +1,6 @@
 @echo off
+chcp 65001 >nul
+cd /d "%~dp0"
 echo ================================================
 echo  PDF 압축기 - 폴더형 빌드 (즉시 실행 / Ghostscript 포함)
 echo ================================================
@@ -6,30 +8,12 @@ echo.
 
 pip install pyinstaller --quiet
 
-:: Ghostscript 경로 자동 탐지
-set GS_DIR=
-for /d %%G in ("C:\Program Files\gs\gs*") do set GS_DIR=%%G
-if "%GS_DIR%"=="" (
-    echo [경고] Ghostscript를 찾을 수 없습니다.
-    echo       Ghostscript 없이 빌드합니다 (PyMuPDF fallback 모드).
-    echo.
-    set ADD_GS=
-) else (
-    echo Ghostscript 감지: %GS_DIR%
-    set ADD_GS=--add-data "%GS_DIR%;gs"
-)
+:: 이전 빌드 결과를 지우고 깨끗하게 다시 만든다 (안 지우면 결과 폴더가 계속 불어남)
+rmdir /s /q build 2>nul
+rmdir /s /q dist 2>nul
 
-:: --onedir 로 빌드 (--onefile 대비 실행 시작 속도가 10배 이상 빠름)
-:: --contents-directory=_internal 로 런타임 파일을 한 폴더에 모아 배포 용이
-pyinstaller --onedir --windowed ^
-    --name "PDF압축기" ^
-    --icon "assets\icon.ico" ^
-    --contents-directory "_internal" ^
-    --collect-all pymupdf ^
-    --collect-all pikepdf ^
-    --collect-all PyQt6 ^
-    %ADD_GS% ^
-    app.py
+:: 빌드 설정(Ghostscript 포함, 필요 없는 패키지 제외)은 PDF압축기.spec 에 있다
+pyinstaller --noconfirm --clean "PDF압축기.spec"
 
 if %errorlevel% neq 0 (
     echo.

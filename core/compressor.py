@@ -39,15 +39,14 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Ghostscript mode arguments
 # ---------------------------------------------------------------------------
-# extreme / recommended:
-#   /screen 베이스(공격적 JPEG 품질) + JPEG 강제 인코딩 + DPI 명시 오버라이드
-#   → 이미 JPEG로 저장된 이미지도 재압축, 큰 압축률 확보
-#
-# low:
-#   /printer 베이스(고품질, 300 DPI) + AutoFilter ON(GS가 인코딩 방식 자동 선택)
-#   + DPI만 200으로 명시 오버라이드
-#   → 이미 잘 압축된 이미지는 건드리지 않고, 해상도만 낮춰 구조 정리 중심 압축
-#   → JPEG 강제 인코딩 없으므로 어떤 파일이든 오히려 커지지 않음
+
+# 컬러/회색 이미지 해상도 (화질/크기 균형을 이걸로 조절)
+GS_DPI = {"extreme": 72, "recommended": 150, "low": 200}
+
+# 흑백(1비트) 이미지 해상도 — 스캔 공문의 글씨가 여기에 해당한다.
+# 흑백 이미지는 CCITT/JBIG2로 원래 아주 작게 압축되므로 해상도를 낮춰도 용량은
+# 거의 안 줄고 글씨만 뭉개진다. 그래서 컬러 DPI와 별개로 판독 가능한 선을 지킨다.
+GS_MONO_DPI = {"extreme": 200, "recommended": 300, "low": 300}
 
 
 def _gs_mode_args(mode: str) -> list[str]:
@@ -58,12 +57,10 @@ def _gs_mode_args(mode: str) -> list[str]:
       무손실(Flate)로 남겨두므로, Flate+JPEG 이중 인코딩 구조의 PDF에서
       오히려 파일이 커지는 문제가 있음.
     - /screen + AutoFilter OFF + JPEG 강제 인코딩이 유일하게 안정적으로 압축됨.
-    - DPI로 화질/크기 균형을 조절:
-        extreme  72 DPI  → 최대 압축 (~89%)
-        recommended 150 DPI → 균형 (~64%)
-        low      200 DPI → 화질 우선 (~44%)
+    - 컬러/회색 DPI로 화질/크기 균형을 조절 (GS_DPI), 흑백은 GS_MONO_DPI.
     """
-    dpi = {"extreme": 72, "recommended": 150, "low": 200}.get(mode, 150)
+    dpi = GS_DPI.get(mode, 150)
+    mono_dpi = GS_MONO_DPI.get(mode, 300)
     return [
         "-dPDFSETTINGS=/screen",
         "-dDownsampleColorImages=true",
@@ -71,7 +68,7 @@ def _gs_mode_args(mode: str) -> list[str]:
         "-dDownsampleMonoImages=true",
         f"-dColorImageResolution={dpi}",
         f"-dGrayImageResolution={dpi}",
-        f"-dMonoImageResolution={dpi}",
+        f"-dMonoImageResolution={mono_dpi}",
         "-dColorImageDownsampleType=/Bicubic",
         "-dGrayImageDownsampleType=/Bicubic",
         # JPEG 강제 인코딩 — Flate로 남는 이미지를 확실히 재압축
@@ -194,16 +191,24 @@ def compress_pdf(input_path: str, output_path: str,
     input_size = os.path.getsize(input_path)
 
     gs_path = find_ghostscript()
-    if gs_path:
-        _compress_ghostscript(gs_path, input_path, output_path,
-                               mode, progress_callback)
-    else:
-        if not HAS_PYMUPDF:
-            raise RuntimeError(
-                "Ghostscript도 PyMuPDF도 없습니다.\n"
-                "'pip install pymupdf' 를 실행하거나 Ghostscript를 설치하세요."
-            )
-        _compress_pymupdf(input_path, output_path, mode, progress_callback)
+    try:
+        if gs_path:
+            _compress_ghostscript(gs_path, input_path, output_path,
+                                   mode, progress_callback)
+        else:
+            if not HAS_PYMUPDF:
+                raise RuntimeError(
+                    "Ghostscript도 PyMuPDF도 없습니다.\n"
+                    "'pip install pymupdf' 를 실행하거나 Ghostscript를 설치하세요."
+                )
+            _compress_pymupdf(input_path, output_path, mode, progress_callback)
+    except Exception:
+        # 실패한 결과물(빈 PDF 등)이 저장 폴더에 남아 정상 파일로 오해받지 않게 지운다
+        try:
+            os.remove(output_path)
+        except OSError:
+            pass
+        raise
 
     output_size = os.path.getsize(output_path)
 
@@ -256,17 +261,31 @@ def _compress_ghostscript(gs_path: str, input_path: str, output_path: str,
     )
 
     current_page = 0
+    other_lines: list[str] = []
     for line in proc.stdout:
         m = re.match(r"Page\s+(\d+)", line.strip())
         if m:
             current_page = int(m.group(1))
             if progress_callback and total_pages > 0:
                 progress_callback(current_page, total_pages)
+        elif line.strip():
+            other_lines.append(line.strip())
 
     proc.wait()
 
+    log_text = " ".join(other_lines)
+    # GS는 암호 PDF·손상 PDF에서도 exit 0으로 "빈 PDF"를 만들어내는 경우가 있다.
+    # 그대로 두면 빈 파일이 "99% 압축 성공"으로 보고되므로 반드시 실패로 처리한다.
+    if "requires a password" in log_text:
+        raise RuntimeError("암호가 걸린 PDF는 압축할 수 없습니다. 암호를 해제한 뒤 다시 시도하세요.")
     if proc.returncode != 0:
-        raise RuntimeError(f"Ghostscript 오류 (exit {proc.returncode})")
+        detail = " ".join(other_lines[-3:])
+        raise RuntimeError(f"Ghostscript 오류 (exit {proc.returncode}){': ' + detail if detail else ''}")
+    out_pages = _get_page_count(output_path)
+    if total_pages and out_pages != total_pages:
+        raise RuntimeError(
+            f"압축 결과가 원본과 다릅니다 (원본 {total_pages}쪽 → 결과 {out_pages}쪽). "
+            "손상된 PDF일 수 있어 결과를 저장하지 않았습니다.")
 
     # Final progress tick if GS didn't print page lines
     if progress_callback and current_page == 0 and total_pages > 0:
@@ -336,6 +355,10 @@ def _recompress_one(doc, xref, profile):
     img_data = base.get("image", b"")
     if len(img_data) < profile["min_bytes"]:
         return
+    # 투명도 마스크(SMask/Mask)가 붙은 이미지는 크기를 바꾸거나 손실 압축하면
+    # 마스크와 어긋나 깨지므로 건너뜀
+    if doc.xref_get_key(xref, "SMask")[0] != "null" or doc.xref_get_key(xref, "Mask")[0] != "null":
+        return
 
     pil_img = Image.open(io.BytesIO(img_data))
 
@@ -367,7 +390,10 @@ def _recompress_one(doc, xref, profile):
     if len(jpeg_bytes) >= len(img_data):
         return
 
-    doc.update_stream(xref, jpeg_bytes, raw=True)
+    # compress=0: JPEG 바이트를 그대로 넣는다 (이때 /Filter 가 지워지므로 아래에서 다시 지정).
+    # 예전 코드는 이 PyMuPDF 버전에 없는 raw=True 를 넘겨서 예외가 조용히 삼켜지고,
+    # 보조 엔진이 이미지를 전혀 압축하지 못하고 있었다.
+    doc.update_stream(xref, jpeg_bytes, compress=0)
     doc.xref_set_key(xref, "Filter", "/DCTDecode")
     doc.xref_set_key(xref, "ColorSpace", "/DeviceRGB")
     doc.xref_set_key(xref, "Width", str(new_w))

@@ -8,11 +8,12 @@ from __future__ import annotations
 import os
 import re
 import sys
+import time
 from dataclasses import dataclass
 from typing import Optional
 
 from PyQt6.QtCore import (
-    QObject, QPoint, QPointF, QPropertyAnimation, QRectF, QSize, Qt, QThread,
+    QObject, QPoint, QPointF, QPropertyAnimation, QRectF, QSettings, QSize, Qt, QThread,
     QTimer, pyqtProperty, pyqtSignal, pyqtSlot,
 )
 from PyQt6.QtGui import (
@@ -26,8 +27,8 @@ from PyQt6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
-from core.compressor import compress_pdf, find_ghostscript
-from core.utils import ensure_dir, format_size, get_output_path
+from core.compressor import GS_DPI, GS_MONO_DPI, compress_pdf, find_ghostscript
+from core.utils import collect_files, ensure_dir, format_size, unique_output_paths
 
 from ui import styles as S
 
@@ -351,11 +352,8 @@ class DropZone(QFrame):
     def dropEvent(self, ev: QDropEvent):
         self.setProperty("dragActive", "false")
         self._refresh()
-        paths = []
-        for url in ev.mimeData().urls():
-            p = url.toLocalFile()
-            if p.lower().endswith(".pdf") and os.path.isfile(p):
-                paths.append(p)
+        # 폴더도 받는다 — 안의 PDF는 _add_files 에서 하위 폴더까지 찾는다
+        paths = [url.toLocalFile() for url in ev.mimeData().urls() if url.toLocalFile()]
         if paths:
             self.filesDropped.emit(paths)
 
@@ -428,22 +426,26 @@ class CompressionWorker(QThread):
     fileError    = pyqtSignal(int, str)            # idx, msg
     allDone      = pyqtSignal(int, int, int)       # n_files, tot_orig, tot_comp
 
-    def __init__(self, entries, mode: str, output_dir: str):
+    def __init__(self, entries, mode: str):
         super().__init__()
-        self.entries = entries              # list of (idx, path)
+        self.entries = entries              # list of (idx, path, out_path)
         self.mode = mode
-        self.output_dir = output_dir
+        self._stop = False
+
+    def request_stop(self):
+        """다음 파일부터 멈춘다 (지금 처리 중인 파일은 끝까지 진행)."""
+        self._stop = True
 
     def run(self):
         total = len(self.entries)
         tot_orig = 0
         tot_comp = 0
 
-        for fi, (idx, path) in enumerate(self.entries):
+        for fi, (idx, path, out_path) in enumerate(self.entries):
+            if self._stop:
+                break
             fname = os.path.basename(path)
             self.fileStarted.emit(idx, fname)
-
-            out_path = get_output_path(path, self.output_dir)
 
             def _cb(cur, tot, fi=fi):
                 pct = (fi + cur / max(tot, 1)) / total * 100
@@ -476,10 +478,15 @@ class MainWindow(QMainWindow):
         self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
 
         self.files: list[dict] = []                 # [{path, size, comp_size, widgets}, ...]
-        self.output_dir = os.path.join(
-            os.path.expanduser("~"), "Desktop", "PDF압축결과")
-        self.current_mode = "recommended"
+        # 저장 위치·압축 수준은 다음 실행 때도 기억한다
+        self.settings = QSettings("xier1108-art", "pdf-compressor")
+        self.output_dir = self.settings.value(
+            "output_dir", os.path.join(os.path.expanduser("~"), "Desktop", "PDF압축결과"), str)
+        self.current_mode = self.settings.value("mode", "recommended", str)
+        if self.current_mode not in GS_DPI:
+            self.current_mode = "recommended"
         self.is_compressing = False
+        self._started_at = 0.0
         self._worker: Optional[CompressionWorker] = None
         self._drag_pos: Optional[QPoint] = None
 
@@ -666,10 +673,15 @@ class MainWindow(QMainWindow):
         q_seg = QFrame(); q_seg.setObjectName("qualitySeg")
         q_seg_lay = QHBoxLayout(q_seg); q_seg_lay.setContentsMargins(4, 4, 4, 4); q_seg_lay.setSpacing(6)
         self._q_cards = {}
+        # 실제로 쓰는 엔진의 설정을 보여준다 (Ghostscript면 DPI, 없으면 보조 엔진의 픽셀/품질)
+        if self._has_gs:
+            spec_text = {q: f"사진 {GS_DPI[q]} DPI · 글씨 스캔 {GS_MONO_DPI[q]} DPI" for q in GS_DPI}
+        else:
+            spec_text = {"extreme": "900px · Q35", "recommended": "1600px · Q65", "low": "2400px · Q85"}
         specs = [
-            QualityCard.Spec("extreme",     "최대 압축", "900px · Q35",  "70–90%"),
-            QualityCard.Spec("recommended", "권장",      "1600px · Q65", "40–70%"),
-            QualityCard.Spec("low",         "저압축",    "2400px · Q85", "20–40%"),
+            QualityCard.Spec("extreme",     "최대 압축", spec_text["extreme"],     "70–90%"),
+            QualityCard.Spec("recommended", "권장",      spec_text["recommended"], "40–70%"),
+            QualityCard.Spec("low",         "저압축",    spec_text["low"],         "20–40%"),
         ]
         for sp in specs:
             card = QualityCard(sp)
@@ -683,8 +695,9 @@ class MainWindow(QMainWindow):
 
         self._set_quality(self.current_mode)
 
-        # Table row deletion
+        # Table row deletion / double-click opens the result
         self.table.keyPressEvent = self._table_keypress
+        self.table.cellDoubleClicked.connect(self._open_row)
         return wrap
 
     def _table_keypress(self, ev):
@@ -744,6 +757,11 @@ class MainWindow(QMainWindow):
         pp_top.addWidget(self.pp_file, 1)
         self.pp_pct = QLabel("0%"); self.pp_pct.setObjectName("progressPct")
         pp_top.addWidget(self.pp_pct)
+        self.stop_btn = QPushButton("중지"); self.stop_btn.setObjectName("spChange")
+        self.stop_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.stop_btn.setToolTip("지금 처리 중인 파일까지만 마치고 멈춥니다")
+        self.stop_btn.clicked.connect(self._stop_compression)
+        pp_top.addWidget(self.stop_btn)
         pp_top_w = QWidget(); pp_top_w.setLayout(pp_top)
         pp.addWidget(pp_top_w)
 
@@ -856,15 +874,22 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(list)
     def _add_files(self, paths: list[str]):
+        if self.is_compressing:
+            return
         existing = {f["path"] for f in self.files}
-        for path in paths:
-            if path in existing or not path.lower().endswith(".pdf"):
+        for path in collect_files(paths, (".pdf",)):
+            if path in existing:
                 continue
-            size = os.path.getsize(path)
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                continue
+            existing.add(path)
             row = self.table.rowCount()
             self.table.insertRow(row)
 
             name_cell = FileNameCell(os.path.basename(path))
+            name_cell.setToolTip(path)
             self.table.setCellWidget(row, 0, name_cell)
 
             orig_item = QTableWidgetItem(format_size(size))
@@ -894,7 +919,11 @@ class MainWindow(QMainWindow):
                 "path": path,
                 "size": size,
                 "comp_size": None,
+                "out_path": None,
+                "status": "pending",   # pending | working | done | error
+                "error": "",
                 "row": row,
+                "name_cell": name_cell,
                 "ratio_widget": ratio,
                 "comp_item": comp_item,
             })
@@ -912,6 +941,8 @@ class MainWindow(QMainWindow):
         self._update_count()
 
     def _remove_selected_rows(self):
+        if self.is_compressing:
+            return
         sel_rows = sorted({i.row() for i in self.table.selectedIndexes()}, reverse=True)
         for r in sel_rows:
             for i, f in enumerate(self.files):
@@ -943,8 +974,21 @@ class MainWindow(QMainWindow):
         path = QFileDialog.getExistingDirectory(
             self, "저장 위치 선택", self.output_dir)
         if path:
-            self.output_dir = path
-            self.path_lbl.setText(self._shorten_path(path))
+            self.output_dir = os.path.normpath(path)
+            self.path_lbl.setText(self._shorten_path(self.output_dir))
+            self.settings.setValue("output_dir", self.output_dir)
+
+    def _file_at_row(self, row: int) -> Optional[dict]:
+        return next((f for f in self.files if f["row"] == row), None)
+
+    def _open_row(self, row: int, _col: int):
+        """완료된 파일은 압축 결과를, 아니면 원본을 연다."""
+        f = self._file_at_row(row)
+        if not f:
+            return
+        target = f["out_path"] if f["status"] == "done" and f["out_path"] else f["path"]
+        if os.path.exists(target):
+            os.startfile(target)  # noqa: S606
 
     # ── Quality ──────────────────────────────────────────────────────────────
 
@@ -952,6 +996,7 @@ class MainWindow(QMainWindow):
         self.current_mode = qid
         for k, card in self._q_cards.items():
             card.setActive(k == qid)
+        self.settings.setValue("mode", qid)
 
     # ── Compression lifecycle ────────────────────────────────────────────────
 
@@ -965,13 +1010,19 @@ class MainWindow(QMainWindow):
         ensure_dir(self.output_dir)
         self.is_compressing = True
         self.compress_btn.setDisabled(True)
+        self.stop_btn.setEnabled(True)
+        self.stop_btn.setText("중지")
 
-        # Reset state
-        for f in self.files:
+        out_paths = unique_output_paths([f["path"] for f in self.files], self.output_dir)
+        for f, out_path in zip(self.files, out_paths):
             f["ratio_widget"].set_pending()
             f["comp_item"].setText("—")
+            f["comp_item"].setToolTip("")
             f["comp_item"].setForeground(QBrush(QColor(S.INK_300)))
             f["comp_size"] = None
+            f["out_path"] = out_path
+            f["status"] = "pending"
+            f["error"] = ""
 
         self.progress_bar.setValue(0)
         self.pp_status.setText("준비 중...")
@@ -981,9 +1032,10 @@ class MainWindow(QMainWindow):
         self.pp_sub_right.setText("")
         self.bottom_stack.setCurrentWidget(self.progress_panel)
         self.pulse_dot.start()
+        self._started_at = time.monotonic()
 
-        entries = [(f["row"], f["path"]) for f in self.files]
-        self._worker = CompressionWorker(entries, self.current_mode, self.output_dir)
+        entries = [(f["row"], f["path"], f["out_path"]) for f in self.files]
+        self._worker = CompressionWorker(entries, self.current_mode)
         self._worker.fileStarted.connect(self._on_file_started)
         self._worker.fileProgress.connect(self._on_file_progress)
         self._worker.fileDone.connect(self._on_file_done)
@@ -991,55 +1043,86 @@ class MainWindow(QMainWindow):
         self._worker.allDone.connect(self._on_all_done)
         self._worker.start()
 
+    def _stop_compression(self):
+        if self._worker and self.is_compressing:
+            self._worker.request_stop()
+            self.stop_btn.setEnabled(False)
+            self.stop_btn.setText("멈추는 중…")
+
     @pyqtSlot(int, str)
     def _on_file_started(self, idx: int, fname: str):
         self.pp_status.setText("처리 중:")
         self.pp_file.setText(fname)
-        for f in self.files:
-            if f["row"] == idx:
-                f["ratio_widget"].set_working()
-                break
+        f = self._file_at_row(idx)
+        if f:
+            f["status"] = "working"
+            f["ratio_widget"].set_working()
         total = len(self.files)
-        done_n = sum(1 for f in self.files if f["comp_size"] is not None) + 1
+        done_n = sum(1 for f in self.files if f["status"] in ("done", "error")) + 1
         self.pp_sub_left.setText(f"{done_n} / {total} 파일")
 
     @pyqtSlot(int, float)
     def _on_file_progress(self, _idx: int, pct: float):
         self.progress_bar.setValue(int(pct))
         self.pp_pct.setText(f"{pct:.0f}%")
-        remaining = max(0, int((100 - pct) / max(pct / 5, 1)))
-        self.pp_sub_right.setText(f"예상 남은 시간: {remaining}초")
+        # 지금까지 걸린 시간으로 남은 시간을 추정 (처음 몇 % 동안은 추정이 부정확해서 숨김)
+        elapsed = time.monotonic() - self._started_at
+        if pct >= 3:
+            remaining = int(elapsed * (100 - pct) / pct)
+            text = f"{remaining // 60}분 {remaining % 60}초" if remaining >= 60 else f"{remaining}초"
+            self.pp_sub_right.setText(f"예상 남은 시간: 약 {text}")
+        else:
+            self.pp_sub_right.setText("남은 시간 계산 중…")
 
     @pyqtSlot(int, int, int, float)
     def _on_file_done(self, idx: int, in_sz: int, out_sz: int, ratio: float):
-        for f in self.files:
-            if f["row"] == idx:
-                f["comp_size"] = out_sz
-                f["comp_item"].setText(format_size(out_sz))
-                f["comp_item"].setForeground(QBrush(QColor(S.INK_900)))
-                fnt = f["comp_item"].font(); fnt.setBold(True); f["comp_item"].setFont(fnt)
-                f["ratio_widget"].set_done(ratio)
-                break
+        f = self._file_at_row(idx)
+        if not f:
+            return
+        f["status"] = "done"
+        f["comp_size"] = out_sz
+        f["comp_item"].setText(format_size(out_sz))
+        f["comp_item"].setToolTip(f"{f['out_path']}\n(더블클릭하면 열립니다)")
+        f["comp_item"].setForeground(QBrush(QColor(S.INK_900)))
+        fnt = f["comp_item"].font(); fnt.setBold(True); f["comp_item"].setFont(fnt)
+        f["ratio_widget"].set_done(ratio)
+        if ratio <= 0:
+            f["ratio_widget"].setToolTip("이미 충분히 압축된 파일이라 더 줄일 수 없어 원본 그대로 저장했습니다")
 
     @pyqtSlot(int, str)
-    def _on_file_error(self, idx: int, _msg: str):
-        for f in self.files:
-            if f["row"] == idx:
-                f["comp_item"].setText("오류")
-                f["comp_item"].setForeground(QBrush(QColor(S.ACCENT)))
-                f["ratio_widget"].set_error()
-                break
+    def _on_file_error(self, idx: int, msg: str):
+        f = self._file_at_row(idx)
+        if not f:
+            return
+        f["status"] = "error"
+        f["error"] = msg or "알 수 없는 오류"
+        f["comp_item"].setText("오류")
+        f["comp_item"].setToolTip(f["error"])
+        f["comp_item"].setForeground(QBrush(QColor(S.ACCENT)))
+        f["ratio_widget"].set_error()
+        f["ratio_widget"].setToolTip(f["error"])
+        f["name_cell"].setToolTip(f"{f['path']}\n\n실패 이유: {f['error']}")
 
     @pyqtSlot(int, int, int)
-    def _on_all_done(self, n_files: int, tot_orig: int, tot_comp: int):
+    def _on_all_done(self, _n_files: int, tot_orig: int, tot_comp: int):
         self.is_compressing = False
         self.compress_btn.setDisabled(False)
         self.pulse_dot.stop()
 
+        ok = sum(1 for f in self.files if f["status"] == "done")
+        failed = [f for f in self.files if f["status"] == "error"]
+        not_run = sum(1 for f in self.files if f["status"] == "pending")
+
+        title = f"{ok}개 파일 압축 완료"
+        if failed:
+            title += f" · {len(failed)}개 실패"
+        if not_run:
+            title += f" · {not_run}개는 중지로 건너뜀"
+        self.success_title.setText(title)
+
         ratio = (1 - tot_comp / tot_orig) * 100 if tot_orig else 0
         saved = tot_orig - tot_comp
-        self.success_title.setText(f"{n_files}개 파일 압축 완료")
-        self.success_stats.setText(
+        stats = (
             f"<span id='successStatsStrong' style='color:{S.SUCCESS_DK};font-weight:700'>"
             f"{format_size(tot_orig)}</span>"
             f" <span style='color:{S.INK_400}'>→</span> "
@@ -1047,6 +1130,13 @@ class MainWindow(QMainWindow):
             f"     <span style='color:{S.SUCCESS};font-weight:700'>−{ratio:.1f}% "
             f"({format_size(saved)} 절약)</span>"
         )
+        if failed:
+            first = failed[0]
+            stats += (f"<br><span style='color:{S.ACCENT}'>실패: {os.path.basename(first['path'])} — "
+                      f"{first['error']}</span>")
+            if len(failed) > 1:
+                stats += f"<span style='color:{S.INK_400}'> 외 {len(failed) - 1}개 (목록의 '오류'에 마우스를 올리면 이유가 보입니다)</span>"
+        self.success_stats.setText(stats)
         self.bottom_stack.setCurrentWidget(self.success_panel)
 
     def _open_output_dir(self):
@@ -1062,3 +1152,15 @@ class MainWindow(QMainWindow):
         self.files.clear()
         self._update_count()
         self.bottom_stack.setCurrentWidget(self.action_panel)
+
+    def closeEvent(self, ev):
+        """압축 중에 창을 닫으면 지금 파일까지만 마치고 안전하게 종료한다."""
+        if self.is_compressing and self._worker:
+            answer = QMessageBox.question(
+                self, "압축 중", "압축이 진행 중입니다. 지금 처리 중인 파일까지만 마치고 종료할까요?")
+            if answer != QMessageBox.StandardButton.Yes:
+                ev.ignore()
+                return
+            self._worker.request_stop()
+            self._worker.wait()
+        ev.accept()
