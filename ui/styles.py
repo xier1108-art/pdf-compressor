@@ -35,7 +35,7 @@ SUCCESS_DK   = "#1f5237"
 SUCCESS_MID  = "#3d6b51"
 SUCCESS_BRD  = "#d5ead9"
 
-APP_VERSION  = "v1.6.0"
+APP_VERSION  = "v1.8.0"
 FONT_SANS    = "Pretendard, Malgun Gothic, \"맑은 고딕\", Segoe UI"
 FONT_MONO    = "Consolas, \"Courier New\", monospace"
 
